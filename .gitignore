@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+# sorties de capture / logs volumineux (les deux captures de reference sont versionnees)
+*.out
+*.log
+!fipd/startserver_session.log
+!fipd/proxy_log_copie.txt
+# dumps RE lourds / donnees machine
+disas_*.txt
+cecil/*.txt
+cecil/cecil_pkg/
+*.png
+*.jpg
+*.mp4
+*.dll
+*.exe
+*.nupkg

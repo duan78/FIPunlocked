@@ -450,6 +450,151 @@ class SettingsDemoApp(App):
             d.rectangle((317, ty, 319, ty + th), fill=fipui.BLUE)
 
 
+class GameApp(App):
+    """REFLEX — mini-jeu : des taupes apparaissent dans les 6 lignes (LED miroir),
+    tape le bouton correspondant avant la fin du chrono.
+    S1-S6 = taper · select = jouer/rejouer · molette droite = niveau +
+    · molette gauche = niveau - (capturée par le jeu, uniquement sur cette page ;
+    les boutons centraux restent la pagination, gérés par le firmware)."""
+    name = 'game'
+    title = 'REFLEX'
+    show_footer = False
+    capture_left_knob = True
+
+    LIVES = 3
+    ROW_H = 40                       # 6 x 40 : lignes alignees sur les boutons
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.state = 'idle'          # idle | run | over
+        self.score = 0
+        self.best = 0
+        self.lives = self.LIVES
+        self.level = 1
+        self.mole = None             # (slot, t0, t1)
+        self.next_at = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+
+    # ---------- boucle de jeu (thread propre, dessins via _redraw_now) ----------
+
+    def on_enter(self):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def on_leave(self):
+        self._stop.set()
+        for i in range(1, 7):
+            self.d.set_led(i, False)
+
+    def _window_ms(self):
+        return max(350, 1100 - 120 * self.level)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            now = time.time()
+            if self.state == 'run':
+                if self.mole and now > self.mole[2]:
+                    self._miss()
+                elif not self.mole and now > self.next_at:
+                    self._spawn(now)
+            self._stop.wait(0.05)
+
+    def _spawn(self, now):
+        import random
+        slot = random.randrange(6)
+        w = self._window_ms() / 1000.0
+        self.mole = (slot, now, now + w)
+        self.d.set_led(slot + 1, True)
+        self.d._redraw_now()
+
+    def _miss(self):
+        self.mole = None
+        self.lives -= 1
+        self.next_at = time.time() + 0.4
+        if self.lives <= 0:
+            self._game_over()
+        self.d._redraw_now()
+
+    def _game_over(self):
+        self.state = 'over'
+        self.best = max(self.best, self.score)
+        self.mole = None
+        for i in range(1, 7):
+            self.d.set_led(i, False)
+        self.alert(f'Score {self.score}')
+
+    # ---------- controles ----------
+
+    def on_event(self, name, pressed):
+        if not pressed:
+            return
+        if name == 'select':
+            self.score = 0
+            self.lives = self.LIVES
+            self.mole = None
+            self.next_at = time.time() + 0.8
+            self.state = 'run'
+        elif name == 'right_cw':
+            self.level = min(9, self.level + 1)
+        elif name == 'left_cw':
+            self.level = max(1, self.level - 1)
+        elif name.startswith('S') and name[1:].isdigit():
+            if self.state != 'run' or not self.mole:
+                return
+            slot, t0, t1 = self.mole
+            if int(name[1:]) - 1 == slot:
+                remaining = max(0.0, t1 - time.time())
+                self.score += 10 * self.level + int(10 * remaining / (self._window_ms() / 1000.0))
+                self.d.set_led(slot + 1, False)
+                self.mole = None
+                self.next_at = time.time() + 0.3
+            else:
+                self._miss()
+            self.d._redraw_now()
+
+    # ---------- rendu ----------
+
+    def render(self, d):
+        for r in range(6):
+            y = r * self.ROW_H
+            yc = y + self.ROW_H // 2
+            if r:
+                d.line((0, y, 191, y), fill=(32, 38, 56))
+            active = (self.state == 'run' and self.mole and self.mole[0] == r)
+            if active:
+                d.rectangle((6, y + 4, 186, y + 36), fill=fipui.BLUE)
+                d.text((96, yc), f'TAPE S{r+1} !', font=F_MED,
+                       fill=(255, 255, 255), anchor='mm')
+            else:
+                d.text((14, yc), f'S{r+1}', font=F_SML, fill=(90, 95, 110),
+                       anchor='lm')
+                d.ellipse((178, yc - 4, 186, yc + 4),
+                          fill=(45, 50, 64) if self.state != 'run' else (60, 70, 95))
+        # panneau de droite : score / vies / niveau / consigne
+        d.rectangle((198, 8, 312, 150), fill=(24, 28, 40), outline=(45, 52, 66))
+        d.text((255, 26), 'REFLEX', font=F_MED, fill=fipui.ACCENT, anchor='mm')
+        d.text((255, 56), str(self.score), font=F_BIG, fill=fipui.FG, anchor='mm')
+        d.text((255, 88), 'VIES ' + str(max(0, self.lives)), font=F_MED,
+               fill=fipui.GREEN if self.lives > 1 else fipui.RED, anchor='mm')
+        d.text((255, 112), f'NIVEAU {self.level}', font=F_MED, fill=fipui.FG,
+               anchor='mm')
+        d.text((255, 136), f'RECORD {self.best}', font=F_SML, fill=fipui.DIM,
+               anchor='mm')
+        if self.state == 'idle':
+            d.text((255, 176), 'select = jouer', font=F_MED, fill=fipui.FG,
+                   anchor='mm')
+            d.text((255, 200), 'molettes = niveau', font=F_SML, fill=fipui.DIM,
+                   anchor='mm')
+            d.text((255, 218), 'S1-S6 = taper', font=F_SML, fill=fipui.DIM,
+                   anchor='mm')
+        elif self.state == 'over':
+            d.text((255, 190), 'PERDU !', font=F_MED, fill=fipui.RED, anchor='mm')
+            d.text((255, 214), 'select = rejouer', font=F_SML, fill=fipui.DIM,
+                   anchor='mm')
+
+
 # ================================ Daemon ================================
 
 class Daemon:
@@ -470,7 +615,8 @@ class Daemon:
         self._gap_timer = None    # detection de l'ecran home Saitek (a sauter)
         self._own_nav = False     # nos propres activations (ne pas detecter de trou)
         self.apps = [ClockApp(self), SystemApp(self), NetworkApp(self),
-                     TesterApp(self), ReaderApp(self), SettingsDemoApp(self)]
+                     TesterApp(self), ReaderApp(self), SettingsDemoApp(self),
+                     GameApp(self)]
 
     def _npages(self):
         return len(self.apps)
@@ -695,7 +841,8 @@ class Daemon:
         # actions internes (pages du FIP) — par defaut les touches restent locales
         if self.mode == 'ui':
             binds = self.bindings.active(self.mode, self.page)
-            if self.bindings.paging_enabled(self.mode, self.page):
+            if (self.bindings.paging_enabled(self.mode, self.page)
+                    and not getattr(self.apps[self.page], 'capture_left_knob', False)):
                 if edges.get('left_ccw'):
                     self._switch_page(self.page + 1)      # borne, pas de bouclage
                 elif edges.get('left_cw'):

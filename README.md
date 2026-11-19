@@ -43,7 +43,7 @@ cd fipd
 python fipd3.py                            # -> http://127.0.0.1:8199
 ```
 
-## 📑 The six built-in pages
+## 📑 The seven built-in pages
 
 ![FIP pages](docs/pages.png)
 
@@ -55,6 +55,7 @@ python fipd3.py                            # -> http://127.0.0.1:8199
 | **4 · Button tester** | S1–S6 light up on press, knobs & select states — instant feedback |
 | **5 · Reader** | Long text scrolled by the **right knob** (44 px/notch) with progress bar |
 | **6 · fipui demo** | Scrollable menu (8 items, 6 visible × 40 px aligned with the buttons): right knob scrolls, S1–S6 and LEDs act on the **visible** rows, action items fire alerts |
+| **7 · REFLEX** | Mini whack-a-mole game: moles pop in the 6 rows (LED mirrors), S1–S6 to whack, select = play/replay, knobs adjust the level (the left knob is captured by the game on this page only — the two middle buttons keep paginating) |
 
 Navigation is **bounded** (no wrap-around) and works from BOTH the left knob and
 the two page buttons between the knobs (firmware-driven, via a `PageChange`
@@ -140,7 +141,8 @@ class MyApp(fipui.App):
 
 The daemon handles everything hardware: current-page rule, single display
 thread (no RPC re-entrancy), keepalive, paging, keyboard bindings (an app
-yields a control when it's bound). `GET /apps` lists pages, `POST /page
+yields a control when it's bound). Apps can also `capture_left_knob = True`
+to own the left knob on their page (like the REFLEX game). `GET /apps` lists pages, `POST /page
 {"page":N}` switches.
 
 ## 💡 LEDs

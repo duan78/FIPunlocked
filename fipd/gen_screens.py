@@ -34,16 +34,23 @@ demo = D.apps[5]
 demo.view = 1                                     # demo : liste defilante (items 2-7)
 demo.states = {0: True, 1: False, 2: True, 3: False, 4: True, 6: True}
 
+game = D.apps[6]                                     # jeu : partie en cours
+game.state = 'run'; game.score = 87; game.lives = 2; game.level = 3
+game.best = 204; game.mole = (1, 0, 99)
+
 labels = ['1 - Clock', '2 - System', '3 - Network', '4 - Button tester',
-          '5 - Reader (right knob)', '6 - fipui demo (menu + LEDs)']
+          '5 - Reader (right knob)', '6 - fipui demo (menu + LEDs)',
+          '7 - REFLEX (mini-game)']
 pages = [D.render_page(i) for i in range(len(D.apps))]
 for i, img in enumerate(pages, 1):
     img.save(os.path.join(OUT, f'page{i}.png'))
 
-# --- grille 3x2 ---
+# --- grille 3xN ---
+import math
 M, LBL = 18, 30
+rows = math.ceil(len(pages) / 3)
 W = 3 * 320 + 4 * M
-H = 2 * 240 + 2 * LBL + 3 * M
+H = rows * 240 + rows * LBL + (rows + 1) * M
 grid = Image.new('RGB', (W, H), (13, 17, 23))
 d = ImageDraw.Draw(grid)
 for i, (img, lab) in enumerate(zip(pages, labels)):

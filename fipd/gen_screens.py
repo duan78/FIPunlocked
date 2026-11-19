@@ -31,8 +31,8 @@ F_LBL = font(17)
 D.apps[3].state = 0x40 | 0x200 | 0x02           # tester : S2+S5 + molette droite
 D.apps[4].scroll = 264                            # reader : milieu du texte
 demo = D.apps[5]
-demo.cursor = 3                                   # demo : curseur sur Notifications
-demo.states = {0: True, 1: False, 2: True, 3: False, 4: True}
+demo.view = 1                                     # demo : liste defilante (items 2-7)
+demo.states = {0: True, 1: False, 2: True, 3: False, 4: True, 6: True}
 
 labels = ['1 - Clock', '2 - System', '3 - Network', '4 - Button tester',
           '5 - Reader (right knob)', '6 - fipui demo (menu + LEDs)']

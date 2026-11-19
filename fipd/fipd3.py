@@ -361,69 +361,93 @@ class ReaderApp(App):
 
 
 class SettingsDemoApp(App):
-    """Demo fipui : 6 lignes PLEINE HAUTEUR alignees sur les 6 boutons physiques.
-    S_N toggle la ligne N (LED N en miroir), molette droite = curseur,
-    ligne 6 = action (alerte)."""
+    """Demo fipui : liste DEFILANTE viewport-relative.
+    8 items, 6 lignes visibles x 40 px alignees sur les boutons physiques.
+    Molette droite = defilement ; boutons S1-S6 et LEDs 1-6 agissent sur les
+    lignes VISIBLES (les etiquettes S1..S6 suivent le defilement).
+    Items 'Redemarrer' et 'Diagnostique' = actions (alerte)."""
     name = 'demo'
     title = 'DEMO FIPUI'
     show_footer = False
 
     ITEMS = ['WiFi', 'Bluetooth', 'Mode sombre', 'Notifications', 'Veille auto',
-             'Redemarrer']
-    ROW_H = 40                       # 6 x 40 = 240 px : pleine hauteur
+             'Redemarrer', 'Mode avion', 'Diagnostique']
+    ACTIONS = {5: 'Redemarrage !', 7: 'Diag OK'}
+    ROW_H = 40                        # 6 x 40 = 240 px : pleine hauteur
+    VISIBLE = 6
 
     def __init__(self, daemon):
         super().__init__(daemon)
-        self.cursor = 0
-        self.states = {0: True, 1: False, 2: True, 3: True, 4: False}
+        self.view = 0                 # premiere ligne visible
+        self.states = {0: True, 1: False, 2: True, 3: True, 4: False, 6: False}
+
+    @property
+    def max_view(self):
+        return max(0, len(self.ITEMS) - self.VISIBLE)
+
+    def sync_leds(self):
+        """LEDs 1-6 = etats des lignes VISIBLES (elles suivent le defilement)."""
+        for r in range(self.VISIBLE):
+            self.leds[r + 1] = self.states.get(self.view + r, False)
 
     def on_enter(self):
         self.sync_leds()
         self.apply_leds()
 
-    def sync_leds(self):
-        for i, on in self.states.items():
-            self.leds[i + 1] = on
+    def _act(self, item):
+        if item in self.ACTIONS:
+            self.alert(self.ACTIONS[item])
+        else:
+            self.states[item] = not self.states[item]
+            self.sync_leds()
+            self.apply_leds()
 
     def on_event(self, name, pressed):
         if not pressed:
             return
         if name == 'right_cw':
-            self.cursor = min(self.cursor + 1, len(self.ITEMS) - 1)
+            self.view = min(self.view + 1, self.max_view)
+            self.sync_leds()
+            self.apply_leds()
         elif name == 'right_ccw':
-            self.cursor = max(self.cursor - 1, 0)
+            self.view = max(self.view - 1, 0)
+            self.sync_leds()
+            self.apply_leds()
         elif name.startswith('S') and name[1:].isdigit():
-            i = int(name[1:]) - 1                 # S1..S6 -> ligne 0..5
-            if self.ITEMS[i] == 'Redemarrer':
-                self.alert('Redemarrage !')
-            else:
-                self.states[i] = not self.states[i]
-                self.set_led(i + 1, self.states[i])
-        elif name == 'select':                    # action sur le curseur aussi
-            if self.ITEMS[self.cursor] == 'Redemarrer':
-                self.alert('Redemarrage !')
-            else:
-                self.states[self.cursor] = not self.states[self.cursor]
-                self.set_led(self.cursor + 1, self.states[self.cursor])
+            r = int(name[1:]) - 1                 # S1..S6 -> ligne visible r
+            item = self.view + r
+            if item < len(self.ITEMS):
+                self._act(item)
 
     def render(self, d):
-        for i, item in enumerate(self.ITEMS):
-            y = i * self.ROW_H
+        for r in range(self.VISIBLE):
+            item = self.view + r
+            if item >= len(self.ITEMS):
+                break
+            y = r * self.ROW_H
             yc = y + self.ROW_H // 2
-            sel = (i == self.cursor)
-            if i:                                  # separateur fin
-                d.line((0, y, 319, y), fill=(32, 38, 56))
-            if sel:                                # barre de curseur a gauche
-                d.rectangle((0, y, 5, y + self.ROW_H - 1), fill=fipui.BLUE)
-            state = self.states.get(i)
+            if r:                                  # separateur fin
+                d.line((0, y, 316, y), fill=(32, 38, 56))
+            state = self.states.get(item)
             if state is not None:                  # pastille on/off a droite
-                d.ellipse((292, yc - 10, 312, yc + 10),
+                d.ellipse((294, yc - 10, 310, yc + 10),
                           fill=fipui.GREEN if state else (45, 50, 64),
                           outline=(160, 220, 180) if state else (80, 85, 100))
-            d.text((18, yc), item, font=F_MED,
-                   fill=fipui.FG if sel else fipui.DIM, anchor='lm')
-            d.text((270, yc), f'S{i+1}', font=F_SML, fill=(90, 95, 110),
+            elif item in self.ACTIONS:             # marqueur action
+                d.polygon([(296, yc - 8), (308, yc), (296, yc + 8)],
+                          fill=fipui.ACCENT)
+            d.text((18, yc), self.ITEMS[item], font=F_MED,
+                   fill=fipui.FG, anchor='lm')
+            d.text((280, yc), f'S{r+1}', font=F_SML, fill=(90, 95, 110),
                    anchor='rm')
+        # mini barre de defilement sur le bord droit
+        n = len(self.ITEMS)
+        if n > self.VISIBLE:
+            ty0, ty1 = 6, 234
+            th = (ty1 - ty0) * self.VISIBLE // n
+            ty = ty0 + (ty1 - ty0 - th) * self.view // self.max_view
+            d.rectangle((317, ty0, 319, ty1), fill=(30, 35, 50))
+            d.rectangle((317, ty, 319, ty + th), fill=fipui.BLUE)
 
 
 # ================================ Daemon ================================
@@ -664,12 +688,7 @@ class Daemon:
                 for name, was_pressed in edges.items():
                     led = LED_OF.get(name)
                     if led:
-                        if was_pressed:
-                            self.set_led(led, True)
-                        else:
-                            # relachement : restaurer l'etat LED voulu par l'app
-                            # (une LED persistante reste allumee, les autres s'eteignent)
-                            self.set_led(led, app.leds.get(led, False))
+                        self.set_led(led, was_pressed)
 
         # actions internes (pages du FIP) — par defaut les touches restent locales
         if self.mode == 'ui':

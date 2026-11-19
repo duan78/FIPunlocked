@@ -24,6 +24,8 @@ controller** for anything: system dashboard, news reader, custom pages, or plain
   two extra LEDs, all individually controllable
 - 🧩 **FIP-native apps** (`fipui.py`) — each page is an app combining rendering,
   button/knob events, persistent LEDs and visual alerts
+- 🎮 **REFLEX mini-game** — whack-a-mole across the 6 rows with LED mirroring,
+  speed bonus, lives, level control on both knobs
 - 📑 **5 built-in pages** (left knob cycles) — see below
 - ⌨️ **Opt-in keyboard bindings** — map `ctrl+shift+s`, `volumemute`, `win+d`…
   on any control. *Default: controls act only on the FIP's own pages, nothing
@@ -155,6 +157,9 @@ states are per firmware page. Button-press lighting can be disabled with
 
 ## 🗺️ Roadmap
 
+- [x] **FIP-native app framework** (`fipui`) — shipped Nov 2026: apps combine
+      display, buttons, knobs, persistent LEDs and alerts; 7 built-in pages
+      including a scrollable settings menu and the REFLEX mini-game
 - [ ] FIP apps: load third-party apps from an `apps/` directory (hot-load),
       more widgets (sliders, spinners, charts)
 - [ ] Capture the exact wire bytes of the page-activation sequence → pure-Python

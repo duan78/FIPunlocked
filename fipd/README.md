@@ -47,7 +47,13 @@ select=0x01, R_CW/CCW=0x02/0x04, L_CW/CCW=0x10/0x08 (confirmés matériel 19/11)
   `ext\Saitek.FIP.dll` (UI WPF) + device raw dans SPAD.neXt.Devices.dll (obfusqué).
   SPAD streame des images rendues côté hôte (pas de serveur embarqué).
 
-## Applications fipui (20/11)
+## Applications fipui (20/11) — 7 pages
+Horloge, Systeme, Reseau, TEST boutons, JOURNAL (lecture molette droite),
+DEMO FIPUI (liste defilante viewport-relative : 8 items, 6 visibles alignees
+sur les boutons, LEDs suivent le viewport) et REFLEX (mini-jeu taupes : un
+bouton S1-S6 lance, LEDs miroir, vies, bonus rapidite, niveaux aux 2 molettes —
+`capture_left_knob` reserve la molette gauche au jeu sur sa page).
+NB : le FIP n'a PAS de bouton select physique (masque 0x01 jamais emis).
 Chaque page = une `fipui.App` (fipui.py) : `render(d)`, `on_event(name, pressed)`,
 `on_enter/on_leave`, `tick()`, LEDs persistantes (`set_led` re-aplique a l'entree,
 les tampons pages etant perdus au RemovePage+AddPage), alertes (`alert()` =

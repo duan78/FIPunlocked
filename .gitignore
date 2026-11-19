@@ -11,6 +11,7 @@ cecil/*.txt
 cecil/cecil_pkg/
 *.png
 *.jpg
+!docs/*.png
 *.mp4
 *.dll
 *.exe

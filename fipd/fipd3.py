@@ -11,7 +11,13 @@ API http://127.0.0.1:8199 (identique v2) :
   POST /screen (PNG/JPG/BMP/WEBP ou ?url=)   affiche une image
   POST /video (fichier)                      joue une video (bouton S1 = stop)
   POST /ui                                   interface integree (molette gauche = page)
-  POST /clear   GET /buttons (SSE) /events /
+  GET/POST /bindings                         raccourcis clavier des boutons (JSON)
+  GET /keys                                  noms de touches reconnus
+  GET /buttons (SSE) /events /
+
+Raccourcis clavier (style Stream Deck) : editez fipd_bindings.json (recharge a chaud)
+ou POST /bindings. Exemples : "S1": "ctrl+shift+s", "S2": "volumemute",
+  "pages": {"1": {"S3": "f5"}}   (surcharge par page, mode ui).
 """
 import io
 import json
@@ -50,6 +56,80 @@ SOFTBUTTONS = {0x01: 'select', 0x02: 'right_cw', 0x04: 'right_ccw', 0x08: 'left_
                0x10: 'left_cw', 0x20: 'S1', 0x40: 'S2', 0x80: 'S3',
                0x100: 'S4', 0x200: 'S5', 0x400: 'S6'}
 
+import json
+import keysend
+
+BINDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fipd_bindings.json')
+
+DEFAULT_BINDINGS = {
+    'paging': True,
+    'bindings': {n: None for n in SOFTBUTTONS.values()},
+    'pages': {},
+}
+
+
+class Bindings:
+    """Raccourcis clavier des boutons (fipd_bindings.json, recharge a chaud)."""
+
+    def __init__(self):
+        self.cfg = dict(DEFAULT_BINDINGS)
+        self._mtime = None
+        self.reload()
+
+    def reload(self):
+        try:
+            m = os.path.getmtime(BINDINGS_FILE)
+        except OSError:
+            if not os.path.exists(BINDINGS_FILE):
+                self.save()
+            return
+        if m == self._mtime:
+            return
+        self._mtime = m
+        try:
+            with open(BINDINGS_FILE, encoding='utf-8') as f:
+                self.cfg = json.load(f)
+        except Exception as e:
+            print('bindings illisibles:', e, flush=True)
+
+    def save(self):
+        with open(BINDINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+        try:
+            self._mtime = os.path.getmtime(BINDINGS_FILE)
+        except OSError:
+            pass
+
+    def active(self, mode, page):
+        """Ensemble effectif : global puis surcharge de la page courante (mode ui)."""
+        self.reload()
+        merged = dict(self.cfg.get('bindings', {}))
+        if mode == 'ui':
+            merged.update(self.cfg.get('pages', {}).get(str(page), {}))
+        return merged
+
+    def dispatch(self, edges, mode, page):
+        """edges = {nom: True(appui) / False(relachement)} -> envoie les combos."""
+        binds = self.active(mode, page)
+        for name, pressed in edges.items():
+            combo = binds.get(name)
+            if not combo:
+                continue
+            try:
+                parts = keysend.parse_combo(combo)
+            except KeyError as e:
+                print(f'bindings: touche inconnue {e} pour {name}', flush=True)
+                continue
+            try:
+                keysend.combo_up(parts) if not pressed else keysend.combo_down(parts)
+            except Exception as e:
+                print('keysend erreur:', e, flush=True)
+
+    def paging_enabled(self, mode, page):
+        binds = self.active(mode, page)
+        return (self.cfg.get('paging', True)
+                and not binds.get('left_cw') and not binds.get('left_ccw'))
+
 
 def load_font(size):
     from PIL import ImageFont
@@ -77,6 +157,8 @@ class Daemon:
         self.hdev = None
         self.status = 'demarrage'
         self.video_stop = threading.Event()
+        self.bindings = Bindings()
+        self._prev_btn = 0
 
     # ---------- demarrage pile officielle ----------
 
@@ -115,14 +197,30 @@ class Daemon:
                 q.append(ev)
             except Exception:
                 self.sse.remove(q)
-        if self.mode == 'ui':
-            if buttons & 0x08:            # left_ccw
+
+        # arret video : S1 en mode video (prioritaire sur les bindings)
+        if self.mode == 'video' and buttons & 0x20 and not self._prev_btn & 0x20:
+            self.video_stop.set()
+
+        # edges : appuis / relachements
+        pressed = buttons & ~self._prev_btn
+        released = self._prev_btn & ~buttons
+        self._prev_btn = buttons
+        edges = {}
+        for bit, n in SOFTBUTTONS.items():
+            if pressed & bit:
+                edges[n] = True
+            elif released & bit:
+                edges[n] = False
+        if edges:
+            self.bindings.dispatch(edges, self.mode, self.page)
+
+        # pagination molette gauche (desactivee si les knobs sont bindes)
+        if self.mode == 'ui' and self.bindings.paging_enabled(self.mode, self.page):
+            if pressed & 0x08:            # left_ccw
                 self.page = (self.page + 1) % 3
-            elif buttons & 0x10:          # left_cw
+            elif pressed & 0x10:          # left_cw
                 self.page = (self.page - 1) % 3
-        elif self.mode == 'video':
-            if buttons & 0x20:            # S1
-                self.video_stop.set()
 
     # ---------- affichage ----------
 
@@ -249,6 +347,12 @@ class H(BaseHTTPRequestHandler):
                     D.sse.remove(q)
         elif self.path == '/events':
             self._json(D.events[-50:])
+        elif self.path == '/bindings':
+            D.bindings.reload()
+            self._json(D.bindings.cfg)
+        elif self.path == '/keys':
+            self._json({'keys': keysend.key_names(),
+                        'exemple': 'ctrl+shift+s, volumemute, f5, alt+tab'})
         elif self.path == '/':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -283,6 +387,24 @@ class H(BaseHTTPRequestHandler):
             if self.path == '/ui':
                 D.mode = 'ui'
                 return self._json({'ok': True, 'mode': D.mode})
+            if self.path == '/bindings':
+                try:
+                    cfg = json.loads(body)
+                except Exception as e:
+                    return self._json({'error': f'json invalide: {e}'}, 400)
+                # validation : chaque combo doit se parser
+                for scope in [cfg.get('bindings', {})] + list(cfg.get('pages', {}).values()):
+                    for name, combo in scope.items():
+                        if combo and name not in SOFTBUTTONS.values():
+                            return self._json({'error': f'bouton inconnu: {name}'}, 400)
+                        if combo:
+                            try:
+                                keysend.parse_combo(combo)
+                            except Exception as e:
+                                return self._json({'error': f'{name}: {e}'}, 400)
+                D.bindings.cfg = cfg
+                D.bindings.save()
+                return self._json({'ok': True, 'bindings': D.bindings.cfg})
             return self._json({'error': 'inconnu'}, 404)
         except Exception as e:
             return self._json({'error': str(e)}, 500)

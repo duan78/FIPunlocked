@@ -70,3 +70,21 @@ plugin's `Create`) and `fipd/proxy_log_copie.txt` (the service's init calls).
   (`sc start DirectOutputService` as admin; on the dev machine it is set to
   `start= auto`)
 - Python 3.10+ with `pillow`, `psutil` (`opencv-python` for `/video`)
+
+## Keyboard shortcuts (Stream-Deck style)
+
+Each button/knob can fire a keyboard combo (native `SendInput`, no extra
+dependency). Edit `fipd/fipd_bindings.json` (hot-reloaded) or use the API:
+
+```bash
+curl -X POST -d '{"paging": true,
+  "bindings": {"S1": "ctrl+shift+s", "S2": "volumemute", "right_cw": "pagedown"},
+  "pages": {"1": {"S3": "f5"}}}' http://127.0.0.1:8199/bindings
+```
+
+- Buttons `S1..S6`, `select`, knobs `left_cw/left_ccw/right_cw/right_ccw`
+- Combos like `ctrl+shift+s`, `win+d`, `alt+tab`; 102 key names via `GET /keys`
+  (media keys included: `volumemute`, `playpause`, `medianext`…)
+- `pages` overrides bindings per FIP page (ui mode); `"paging": false` frees the
+  left knob (default: left knob keeps switching the built-in UI pages)
+- Hold-aware: keys go down on press, up on release

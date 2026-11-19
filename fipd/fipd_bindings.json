@@ -1,0 +1,14 @@
+{
+  "paging": true,
+  "bindings": {
+    "S1": "volumedown",
+    "S2": "volumeup",
+    "S3": "volumemute",
+    "S4": "medianext",
+    "S5": "mediaprev",
+    "S6": "playpause",
+    "right_cw": "pagedown",
+    "right_ccw": "pageup"
+  },
+  "pages": {}
+}

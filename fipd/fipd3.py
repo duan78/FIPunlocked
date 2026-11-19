@@ -264,7 +264,7 @@ class Daemon:
             do.DirectOutput_RemovePage(self.hdev, fw)
         except OSError:
             pass                      # page inconnue : premier enregistrement
-        time.sleep(0.1)
+        time.sleep(0.03)
         try:
             do.DirectOutput_AddPage(self.hdev, fw, f'fipd{page + 1}', 1)
             return 0
@@ -309,7 +309,7 @@ class Daemon:
             self._draw_evt.set()
             print(f'[page] home Saitek saute -> page {target + 1}', flush=True)
 
-        self._gap_timer = threading.Timer(0.15, skip_home)
+        self._gap_timer = threading.Timer(0.05, skip_home)
         self._gap_timer.daemon = True
         self._gap_timer.start()
 
@@ -318,8 +318,8 @@ class Daemon:
         AUCUN appel DirectOutput ici (reentrance) : on programme le redraw."""
         idx = fwpage - FW_BASE
         if fwpage < 0x80000000:              # ids plausibles seulement (pas les -1)
-            print(f'[page] fw={fwpage} active={bool(active)} idx={idx}',
-                  flush=True)
+            print(f'[page] t={time.time():.3f} fw={fwpage} active={bool(active)} '
+                  f'idx={idx}', flush=True)
         if not (0 <= idx < NBPAGES):
             return
         if active:

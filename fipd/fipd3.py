@@ -588,9 +588,11 @@ class Daemon:
         self._draw_evt.set()
 
     def _enter_app(self, idx):
-        """Cycle d'entree : LEDs persistantes re-appliquees (tampons perdus)."""
+        """Cycle d'entree : LEDs persistantes re-appliquees (tampons perdus),
+        LEDs non revendiquees (7-8 en particulier) eteintes."""
         try:
             self.apps[idx].on_enter()
+            self.apps[idx].restore_leds()
         except Exception as e:
             print(f'on_enter({idx}): {e}', flush=True)
 

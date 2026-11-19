@@ -69,6 +69,15 @@ class App:
         for idx, on in self.leds.items():
             self.d.set_led(idx, on)
 
+    def restore_leds(self):
+        """Applique l'etat souhaite ET eteint les LEDs non revendiquees (1-8) :
+        les LEDs fixes 7-8 retombent ainsi a OFF sur les pages qui ne les
+        utilisent pas (etat stock = allume)."""
+        self.apply_leds()
+        for led in range(1, 9):
+            if led not in self.leds:
+                self.d.set_led(led, False)
+
     def clear_leds(self):
         for idx in list(self.leds):
             self.set_led(idx, False)
@@ -88,7 +97,7 @@ class App:
         age = time.time() - t0
         if age >= ALERT_SECONDS:
             self._alert = None
-            self.apply_leds()               # restaure les LEDs (fin clignotement)
+            self.restore_leds()             # restaure les LEDs (fin clignotement)
             return
         if int(age * 4) % 2 == 0:           # ~2 Hz
             d.rectangle((0, 0, 319, 26), fill=RED)

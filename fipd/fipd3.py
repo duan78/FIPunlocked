@@ -453,9 +453,10 @@ class SettingsDemoApp(App):
 class GameApp(App):
     """REFLEX — mini-jeu : des taupes apparaissent dans les 6 lignes (LED miroir),
     tape le bouton correspondant avant la fin du chrono.
-    S1-S6 = taper · select = jouer/rejouer · molette droite = niveau +
-    · molette gauche = niveau - (capturée par le jeu, uniquement sur cette page ;
-    les boutons centraux restent la pagination, gérés par le firmware)."""
+    N'importe quel bouton S1-S6 = lancer/rejouer · S1-S6 = taper en jeu
+    · molette droite = niveau + · molette gauche = niveau - (capturée par le
+    jeu, uniquement sur cette page ; les boutons centraux restent la pagination,
+    gérés par le firmware). NB : le FIP n'a PAS de bouton select physique."""
     name = 'game'
     title = 'REFLEX'
     show_footer = False
@@ -530,18 +531,20 @@ class GameApp(App):
     def on_event(self, name, pressed):
         if not pressed:
             return
-        if name == 'select':
-            self.score = 0
-            self.lives = self.LIVES
-            self.mole = None
-            self.next_at = time.time() + 0.8
-            self.state = 'run'
-        elif name == 'right_cw':
+        if name == 'right_cw':
             self.level = min(9, self.level + 1)
         elif name == 'left_cw':
             self.level = max(1, self.level - 1)
         elif name.startswith('S') and name[1:].isdigit():
-            if self.state != 'run' or not self.mole:
+            if self.state != 'run':           # idle/over : n'importe quel bouton lance
+                self.score = 0
+                self.lives = self.LIVES
+                self.mole = None
+                self.next_at = time.time() + 0.8
+                self.state = 'run'
+                self.d._redraw_now()
+                return
+            if not self.mole:
                 return
             slot, t0, t1 = self.mole
             if int(name[1:]) - 1 == slot:
@@ -583,7 +586,7 @@ class GameApp(App):
         d.text((255, 136), f'RECORD {self.best}', font=F_SML, fill=fipui.DIM,
                anchor='mm')
         if self.state == 'idle':
-            d.text((255, 176), 'select = jouer', font=F_MED, fill=fipui.FG,
+            d.text((255, 176), 'un bouton = jouer', font=F_MED, fill=fipui.FG,
                    anchor='mm')
             d.text((255, 200), 'molettes = niveau', font=F_SML, fill=fipui.DIM,
                    anchor='mm')
@@ -591,7 +594,7 @@ class GameApp(App):
                    anchor='mm')
         elif self.state == 'over':
             d.text((255, 190), 'PERDU !', font=F_MED, fill=fipui.RED, anchor='mm')
-            d.text((255, 214), 'select = rejouer', font=F_SML, fill=fipui.DIM,
+            d.text((255, 214), 'un bouton = rejouer', font=F_SML, fill=fipui.DIM,
                    anchor='mm')
 
 

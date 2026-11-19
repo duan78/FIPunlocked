@@ -55,7 +55,7 @@ python fipd3.py                            # -> http://127.0.0.1:8199
 | **4 · Button tester** | S1–S6 light up on press, knobs & select states — instant feedback |
 | **5 · Reader** | Long text scrolled by the **right knob** (44 px/notch) with progress bar |
 | **6 · fipui demo** | Scrollable menu (8 items, 6 visible × 40 px aligned with the buttons): right knob scrolls, S1–S6 and LEDs act on the **visible** rows, action items fire alerts |
-| **7 · REFLEX** | Mini whack-a-mole game: moles pop in the 6 rows (LED mirrors), S1–S6 to whack, select = play/replay, knobs adjust the level (the left knob is captured by the game on this page only — the two middle buttons keep paginating) |
+| **7 · REFLEX** | Mini whack-a-mole game: moles pop in the 6 rows (LED mirrors), S1–S6 to whack — any button starts/replays, knobs adjust the level (the left knob is captured by the game on this page only — the two middle buttons keep paginating) |
 
 Navigation is **bounded** (no wrap-around) and works from BOTH the left knob and
 the two page buttons between the knobs (firmware-driven, via a `PageChange`
@@ -176,4 +176,6 @@ states are per firmware page. Button-press lighting can be disabled with
 - Windows only for now (Linux port on the roadmap)
 - `SendInput` bindings don't reach elevated windows unless the daemon runs elevated
 - Button masks (HID `mi_00`, hardware-confirmed): `S1..S6 = 0x20..0x400`,
-  `select = 0x01`, right knob CW/CCW `0x02/0x04`, left knob CW/CCW `0x10/0x08`
+  right knob CW/CCW `0x02/0x04`, left knob CW/CCW `0x10/0x08`. Note: the FIP has
+  **no physical select button** (mask 0x01 is never emitted; the `.dat`
+  descriptor lists 12 controls, none of which is a select)

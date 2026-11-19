@@ -51,8 +51,11 @@ python fipd3.py                            # -> http://127.0.0.1:8199
 | **4 · Button tester** | S1–S6 light up on press, knobs & select states — instant feedback |
 | **5 · Reader** | Long text scrolled by the **right knob** (44 px/notch) with progress bar |
 
-Left knob = previous/next page. The reader scrolls only when the right knob has
-no binding configured.
+Navigation is **bounded** (no wrap-around) and works from BOTH the left knob and
+the two page buttons between the knobs (firmware-driven, via a `PageChange`
+callback — with our 5 pages registered they cycle *our* pages instead of the
+stock Saitek screens). The reader scrolls only when the right knob has no
+binding configured.
 
 ## ⌨️ Keyboard bindings (Stream-Deck mode, opt-in)
 
@@ -98,8 +101,10 @@ Initialize → Enumerate → RegisterSoftButtonCallback → AddPage(0, FLAG_SET_
 
 Firmware quirks discovered along the way: HID reports only flow while a page is
 **active** and images keep coming (the panel falls back to its home screen after
-~2–3 s idle), and a clean service shutdown closes the session (USB power-cycle
-resets it).
+~2–3 s idle); you can only draw on the page the firmware **currently displays**
+(`AddPage` makes the new page current, re-activating requires `RemovePage` +
+`AddPage` — see `fipd/probe_pages2.py`); and a clean service shutdown closes the
+session (USB power-cycle resets it).
 
 Everything was reverse-engineered from scratch — disassembly of the plugin DLL
 (capstone/pefile, `disas_*.py`), IL dumps of the client libraries (Mono.Cecil,

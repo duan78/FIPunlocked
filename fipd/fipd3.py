@@ -7,17 +7,20 @@ installe une fois pour toutes). Ecran + 6 boutons + 2 molettes, sans SPAD ni lic
 Prerequis : service DirectOutputService demarre (voir README).
   (demarrage : sc start DirectOutputService  — droits admin)
 
-API http://127.0.0.1:8199 (identique v2) :
+Pages integrees (molette gauche) :
+  1. Horloge   2. Systeme   3. Reseau   4. TEST boutons   5. Lecture (molette droite)
+
+Par defaut, les touches ne pilotent QUE les pages du FIP (rien n'est execute sur la
+machine). Opt-in uniquement : racourcis clavier via fipd_bindings.json (recharge a
+chaud) ou POST /bindings — ex. {"S1": "ctrl+shift+s"}.
+
+API http://127.0.0.1:8199 :
   POST /screen (PNG/JPG/BMP/WEBP ou ?url=)   affiche une image
   POST /video (fichier)                      joue une video (bouton S1 = stop)
-  POST /ui                                   interface integree (molette gauche = page)
-  GET/POST /bindings                         raccourcis clavier des boutons (JSON)
+  POST /ui                                   revient a l'interface integree
+  GET/POST /bindings                         racourcis clavier des boutons (JSON)
   GET /keys                                  noms de touches reconnus
   GET /buttons (SSE) /events /
-
-Raccourcis clavier (style Stream Deck) : editez fipd_bindings.json (recharge a chaud)
-ou POST /bindings. Exemples : "S1": "ctrl+shift+s", "S2": "volumemute",
-  "pages": {"1": {"S3": "f5"}}   (surcharge par page, mode ui).
 """
 import io
 import json
@@ -30,6 +33,8 @@ import ctypes
 import ctypes.wintypes as wt
 
 PORT = 8199
+NBPAGES = 5
+SCROLL_STEP = 44          # px par cran de molette (page Lecture)
 DO_DIR = r'C:\Program Files\Logitech\DirectOutput'
 
 os.chdir(DO_DIR)
@@ -159,6 +164,8 @@ class Daemon:
         self.video_stop = threading.Event()
         self.bindings = Bindings()
         self._prev_btn = 0
+        self._scroll = 0          # offset page Lecture
+        self._txt_img = None      # cache du long texte pre-rendu
 
     # ---------- demarrage pile officielle ----------
 
@@ -215,12 +222,24 @@ class Daemon:
         if edges:
             self.bindings.dispatch(edges, self.mode, self.page)
 
-        # pagination molette gauche (desactivee si les knobs sont bindes)
-        if self.mode == 'ui' and self.bindings.paging_enabled(self.mode, self.page):
-            if pressed & 0x08:            # left_ccw
-                self.page = (self.page + 1) % 3
-            elif pressed & 0x10:          # left_cw
-                self.page = (self.page - 1) % 3
+        # actions internes (pages du FIP) — par defaut les touches restent locales
+        if self.mode == 'ui':
+            binds = self.bindings.active(self.mode, self.page)
+            if self.bindings.paging_enabled(self.mode, self.page):
+                if edges.get('left_ccw'):
+                    self._scroll = 0
+                    self.page = (self.page + 1) % NBPAGES
+                elif edges.get('left_cw'):
+                    self._scroll = 0
+                    self.page = (self.page - 1) % NBPAGES
+            if self.page == 4:
+                # molette droite = defilement du texte (sauf si bindee clavier)
+                if not binds.get('right_cw') and edges.get('right_cw'):
+                    self._scroll = min(self._scroll + SCROLL_STEP, self._text_max())
+                elif not binds.get('right_ccw') and edges.get('right_ccw'):
+                    self._scroll = max(self._scroll - SCROLL_STEP, 0)
+            if self.page in (3, 4) and edges:
+                self._redraw_now()      # retour visuel immediat
 
     # ---------- affichage ----------
 
@@ -228,8 +247,17 @@ class Daemon:
         from PIL import Image
         img = img.convert('RGB').resize((320, 240)).transpose(Image.FLIP_TOP_BOTTOM)
         buf = ctypes.create_string_buffer(img.tobytes(), 320 * 240 * 3)
-        self._last_raw = buf
-        do.DirectOutput_SetImage(self.hdev, 0, 0, 320 * 240 * 3, buf)
+        with self.lock:                      # callback boutons + keepalive serrialises
+            self._last_raw = buf
+            do.DirectOutput_SetImage(self.hdev, 0, 0, 320 * 240 * 3, buf)
+
+    def _redraw_now(self):
+        """Redessine la page courante immediatement (feedback des boutons)."""
+        if self.hdev:
+            try:
+                self._send(self.render_page())
+            except Exception:
+                pass
 
     def show_image(self, img, mode='image'):
         self.mode = mode
@@ -243,11 +271,121 @@ class Daemon:
                     if self.mode == 'ui':
                         self._send(self.render_page())
                     elif getattr(self, '_last_raw', None):
-                        do.DirectOutput_SetImage(self.hdev, 0, 0, 320 * 240 * 3,
-                                                 self._last_raw)
+                        with self.lock:
+                            do.DirectOutput_SetImage(self.hdev, 0, 0, 320 * 240 * 3,
+                                                     self._last_raw)
                 except Exception:
                     pass
             time.sleep(2.0)
+
+    LONG_TEXT = (
+        "FIPd — journal du driver maison\n"
+        "\n"
+        "04/11/2026 — Naissance du projet. Le Flight Instrument Panel de Saitek "
+        "(VID_06A3, PID_A2AE) croupissait dans un tiroir : son logiciel officiel "
+        "ne servait qu'aux simulateurs de vol. Objectif : en faire un ecran 320x240 "
+        "generique, avec ses 6 boutons et ses 2 molettes utilisables.\n"
+        "\n"
+        "Premiere soiree : retro-ingenerie du protocole USB. L'interface bulk du "
+        "driver accepte des requetes a en-tete de 44 octets en big-endian : "
+        "ServerID, Flags, Longueur, RequestID... L'image est du BGR 320x240x24 "
+        "brut, 230400 octets. Premier carre rouge affiche a 23h12 — victoire.\n"
+        "\n"
+        "Mais l'ecran retombe sur sa page d'accueil Saitek toutes les 4 secondes "
+        "sans rafraichissement : le firmware exige un keepalive. Un thread de "
+        "reaffichage regle le probleme.\n"
+        "\n"
+        "05/11/2026 — La chasse aux boutons. Le HID de l'interface MI_00 reste "
+        "muet : le firmware n'emmet rien tant qu'une page n'est pas active chez "
+        "l'hote. SPAD.neXt, lui, y arrive — on le lance, on le tue, on prend le "
+        "relais. Le daemon v2 marche, mais depend de SPAD. Inacceptable.\n"
+        "\n"
+        "19/11/2026 — La verite eclate. DirectOutput.dll n'est qu'un client de "
+        "pipes nommes vers DirectOutputService, un service systeme qui heberge "
+        "le vrai plugin device. Une DLL proxy compilee avec gcc s'intercale dans "
+        "le service et loggue sa sequence d'init : Create, callbacks, Activate. "
+        "Aucun upload de firmware — la theorie du serveur embarque etait fausse.\n"
+        "\n"
+        "Le client Python officiel marche enfin : Initialize, Enumerate, "
+        "RegisterSoftButtonCallback, AddPage(ACTIVE), SetImage. Les 6 boutons "
+        "respondent, les molettes pulsent cran par cran. Le daemon v3 ne depend "
+        "plus de rien de payant.\n"
+        "\n"
+        "Prochaines etapes : capturer les octets exacts de l'activation de page "
+        "pour s'affranchir totalement de la pile Logitech sous Windows, puis "
+        "porter le pilote pur sous Linux (libusb + hidraw). L'aventure continue."
+    )
+
+    def _text_img(self):
+        """Le long texte pre-rendu une fois en image haute (cachee)."""
+        import textwrap
+        from PIL import Image, ImageDraw
+        if self._txt_img is None:
+            lines = []
+            for para in self.LONG_TEXT.split('\n'):
+                lines += textwrap.wrap(para, width=44) or ['']
+            h = 14 + len(lines) * 17 + 20
+            img = Image.new('RGB', (320, h), (12, 14, 20))
+            d = ImageDraw.Draw(img)
+            y = 8
+            for ln in lines:
+                d.text((10, y), ln, font=F_SML, fill=(222, 226, 235))
+                y += 17
+            self._txt_img = img
+        return self._txt_img
+
+    def _text_max(self):
+        return max(0, self._text_img().height - 212)
+
+    def _render_buttons_test(self, d):
+        """Page 4 : testeur S1-S6 + etat select/molettes, retour visuel live."""
+        d.text((160, 12), 'TEST BOUTONS', font=F_MED, fill=(255, 210, 80), anchor='mm')
+        boxes = [(0x20, 'S1'), (0x40, 'S2'), (0x80, 'S3'),
+                 (0x100, 'S4'), (0x200, 'S5'), (0x400, 'S6')]
+        bw, bh, gap, x0, y0 = 92, 52, 12, 10, 30
+        for i, (bit, name) in enumerate(boxes):
+            x = x0 + (i % 3) * (bw + gap)
+            y = y0 + (i // 3) * (bh + 10)
+            on = self._prev_btn & bit
+            if on:
+                d.rectangle((x, y, x + bw, y + bh), fill=(70, 200, 120),
+                            outline=(180, 255, 200))
+                d.text((x + bw // 2, y + bh // 2), name, font=F_MED,
+                       fill=(10, 30, 16), anchor='mm')
+            else:
+                d.rectangle((x, y, x + bw, y + bh), outline=(90, 95, 110))
+                d.text((x + bw // 2, y + bh // 2), name, font=F_MED,
+                       fill=(150, 155, 170), anchor='mm')
+        mini = [(0x01, 'SEL'), (0x10, 'L>'), (0x08, '<L'), (0x02, 'R>'), (0x04, '<R')]
+        x = 12
+        for bit, lab in mini:
+            on = self._prev_btn & bit
+            d.rectangle((x, 158, x + 52, 178),
+                        fill=(60, 90, 160) if on else None,
+                        outline=(90, 95, 110) if not on else (150, 180, 255))
+            d.text((x + 26, 168), lab, font=F_SML,
+                   fill=(235, 240, 255) if on else (140, 145, 160), anchor='mm')
+            x += 60
+
+    def _render_reader(self):
+        """Page 5 : long texte defilant (molette droite) + barre de progression."""
+        from PIL import Image, ImageDraw
+        base = Image.new('RGB', (320, 240), (12, 14, 20))
+        d = ImageDraw.Draw(base)
+        d.rectangle((0, 0, 319, 19), fill=(24, 28, 40))
+        d.text((8, 10), 'JOURNAL', font=F_MED, fill=(255, 210, 80), anchor='lm')
+        d.text((312, 10), 'molette droite', font=F_SML, fill=(130, 135, 150),
+               anchor='rm')
+        win = self._text_img().crop((0, self._scroll, 320, self._scroll + 212))
+        base.paste(win, (0, 20))
+        # barre de progression a droite
+        mx = self._text_max()
+        if mx > 0:
+            d.rectangle((314, 24, 318, 228), outline=(70, 75, 90))
+            th = max(8, int(204 * 212 / (mx + 212)))
+            ty = 24 + int((204 - th) * self._scroll / mx)
+            d.rectangle((315, ty, 317, ty + th), fill=(90, 160, 230))
+        return base
 
     def render_page(self):
         import psutil
@@ -269,7 +407,7 @@ class Daemon:
             d.text((15, 105), 'RAM  {:5.1f} %'.format(mem), font=F_MED, fill=(255, 255, 255))
             d.rectangle((15, 135, 305, 147), outline=(90, 90, 90))
             d.rectangle((15, 135, 15 + int(290 * mem / 100), 147), fill=(200, 120, 80))
-        else:
+        elif self.page == 2:
             d.text((15, 12), 'RESEAU', font=F_MED, fill=(255, 210, 80))
             y = 48
             io2 = psutil.net_io_counters()
@@ -285,7 +423,11 @@ class Daemon:
                     d.text((15, y), '{:12s} {}'.format(nm[:12], ip),
                            font=F_SML, fill=(170, 200, 170))
                     y += 22
-        d.text((160, 228), 'page {}/3  (molette gauche)'.format(self.page + 1),
+        elif self.page == 3:
+            self._render_buttons_test(d)
+        else:
+            return self._render_reader()
+        d.text((160, 228), 'page {}/{}  (molette gauche)'.format(self.page + 1, NBPAGES),
                font=F_SML, fill=(120, 120, 130), anchor='mm')
         return img
 

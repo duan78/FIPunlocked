@@ -16,9 +16,16 @@ python fipd3.py        # -> http://127.0.0.1:8199
 |---|---|
 | `POST /screen` (body = PNG/JPG/BMP/WEBP, or `?url=...`) | Display an image |
 | `POST /video` (body = video file) | Play a video (button S1 = stop) |
-| `POST /ui` | Built-in UI (clock / system / network; left knob = page) |
+| `POST /ui` | Built-in UI (left knob = page) |
 | `GET /buttons` | Server-Sent Events for buttons & knobs |
 | `GET /events` / `GET /` | Recent events / status page |
+
+Built-in pages (left knob cycles): 1. clock · 2. system · 3. network ·
+4. **button tester** (live S1–S6 / knobs feedback) · 5. **reader** (long text
+scrolled by the right knob, with progress bar).
+
+By default buttons/knobs only drive the FIP's own pages — nothing is executed on
+the host machine unless you opt in via bindings.
 
 Button masks (HID `mi_00`, confirmed on hardware): `S1..S6 = 0x20..0x400`,
 select `0x01`, right knob CW/CCW `0x02/0x04`, left knob CW/CCW `0x10/0x08`.
@@ -86,5 +93,7 @@ curl -X POST -d '{"paging": true,
 - Combos like `ctrl+shift+s`, `win+d`, `alt+tab`; 102 key names via `GET /keys`
   (media keys included: `volumemute`, `playpause`, `medianext`…)
 - `pages` overrides bindings per FIP page (ui mode); `"paging": false` frees the
-  left knob (default: left knob keeps switching the built-in UI pages)
+  left knob (default: left knob keeps switching the built-in UI pages); an
+  internal action (e.g. right-knob scrolling on the reader page) yields to a
+  binding if one is configured for that control
 - Hold-aware: keys go down on press, up on release

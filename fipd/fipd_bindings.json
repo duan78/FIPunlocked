@@ -1,14 +1,17 @@
 {
   "paging": true,
   "bindings": {
-    "S1": "volumedown",
-    "S2": "volumeup",
-    "S3": "volumemute",
-    "S4": "medianext",
-    "S5": "mediaprev",
-    "S6": "playpause",
-    "right_cw": "pagedown",
-    "right_ccw": "pageup"
+    "select": null,
+    "right_cw": null,
+    "right_ccw": null,
+    "left_ccw": null,
+    "left_cw": null,
+    "S1": null,
+    "S2": null,
+    "S3": null,
+    "S4": null,
+    "S5": null,
+    "S6": null
   },
   "pages": {}
 }

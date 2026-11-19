@@ -173,6 +173,8 @@ class Daemon:
         self._page_cb = None      # reference PageChange (GC)
         self._draw_evt = threading.Event()   # redraw asynchrone (jamais de SetImage
                                              # depuis un callback du service = reentrance)
+        self._gap_timer = None    # detection de l'ecran home Saitek (a sauter)
+        self._own_nav = False     # nos propres activations (ne pas detecter de trou)
 
     # ---------- demarrage pile officielle ----------
 
@@ -202,7 +204,8 @@ class Daemon:
         # 5 pages firmware (ids 1..5) : les boutons ↑/↓ cyclent NOS pages,
         # plus d'ecrans d'accueil Saitek.
         # purge defensive : pages d'une session precedente mal terminee
-        for i in range(NBPAGES):
+        self._own_nav = True                  # nos Add/Remove ne doivent pas armer
+        for i in range(NBPAGES):              # la detection d'ecran home
             try:
                 do.DirectOutput_RemovePage(self.hdev, FW_BASE + i)
             except OSError:
@@ -212,11 +215,12 @@ class Daemon:
         for i in range(NBPAGES):
             hrs.append(do.DirectOutput_AddPage(self.hdev, FW_BASE + i, f'fipd{i+1}',
                                                1 if i == 0 else 0))  # 1 = ACTIVE
-        time.sleep(0.4)                       # laisser le service enregistrer les pages
         # E_PAGENOTACTIVE : seul un dessin sur la page COURANTE est accepte.
         # Les 5 pages sont enregistrees (boutons ↑/↓), puis on rend la 1re courante.
         self._activate(0)
         self._refresh_page(0)
+        time.sleep(0.5)                       # laisser fuiter les callbacks d'init
+        self._own_nav = False
         self.status = (f'OK (device 0x{self.hdev:x}, pages ' +
                        ' '.join(f'{h & 0xFFFFFFFF:08X}' for h in hrs) + ')')
         threading.Thread(target=self._keepalive, daemon=True).start()
@@ -281,25 +285,60 @@ class Daemon:
         self._pending_activate = new          # le thread d'affichage activera + dessinera
         self._draw_evt.set()
 
+    def _cancel_gap(self):
+        if self._gap_timer is not None:
+            self._gap_timer.cancel()
+            self._gap_timer = None
+
+    def _arm_gap(self, idx):
+        """Apres la desactivation de la page idx sans activation qui suit :
+        le firmware est tombe sur son ecran home (Saitek) -> on saute au
+        prolongement du cycle (home est sur l'axe 1<->5)."""
+        self._cancel_gap()
+        if idx not in (0, NBPAGES - 1):
+            return
+
+        def skip_home():
+            target = NBPAGES - 1 if idx == 0 else 0
+            self._gap_timer = None
+            if self._own_nav or self.page != idx:
+                return
+            self._scroll = 0
+            self.page = target
+            self._pending_activate = target
+            self._draw_evt.set()
+            print(f'[page] home Saitek saute -> page {target + 1}', flush=True)
+
+        self._gap_timer = threading.Timer(0.15, skip_home)
+        self._gap_timer.daemon = True
+        self._gap_timer.start()
+
     def _on_page(self, h, fwpage, active, ctx):
         """Callback firmware : boutons page ↑/↓ (entre les molettes).
         AUCUN appel DirectOutput ici (reentrance) : on programme le redraw."""
         idx = fwpage - FW_BASE
-        if not active or not (0 <= idx < NBPAGES):
+        if fwpage < 0x80000000:              # ids plausibles seulement (pas les -1)
+            print(f'[page] fw={fwpage} active={bool(active)} idx={idx}',
+                  flush=True)
+        if not (0 <= idx < NBPAGES):
             return
-        if idx != self.page:
-            self._scroll = 0
-            self.page = idx
-        self.mode = 'ui'                      # les boutons ↑/↓ reviennent au dashboard
-        self._draw_evt.set()                  # le thread d'affichage dessinera
-        ev = {'t': time.time(), 'state': 0, 'names': ['page_updown'], 'page': idx}
-        self.events.append(ev)
-        self.events = self.events[-200:]
-        for q in list(self.sse):
-            try:
-                q.append(ev)
-            except Exception:
-                self.sse.remove(q)
+        if active:
+            self._cancel_gap()
+            if idx != self.page:
+                self._scroll = 0
+                self.page = idx
+            self.mode = 'ui'                  # les boutons ↑/↓ reviennent au dashboard
+            self._draw_evt.set()              # le thread d'affichage dessinera
+            ev = {'t': time.time(), 'state': 0, 'names': ['page_updown'], 'page': idx}
+            self.events.append(ev)
+            self.events = self.events[-200:]
+            for q in list(self.sse):
+                try:
+                    q.append(ev)
+                except Exception:
+                    self.sse.remove(q)
+        elif not self._own_nav:
+            self._arm_gap(idx)
 
     def _on_btn(self, h, buttons, ctx):
         names = [n for b, n in SOFTBUTTONS.items() if buttons & b]
@@ -378,7 +417,11 @@ class Daemon:
                     pend = getattr(self, '_pending_activate', None)
                     if pend is not None:
                         self._pending_activate = None
-                        self._activate(pend)
+                        self._own_nav = True
+                        try:
+                            self._activate(pend)
+                        finally:
+                            self._own_nav = False
                     self._refresh_page(self.page)
                 elif getattr(self, '_last_raw', None):
                     with self.lock:

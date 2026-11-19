@@ -22,6 +22,8 @@ controller** for anything: system dashboard, news reader, custom pages, or plain
 - 🔘 **6 side buttons + 2 knobs** — live feedback, edge detection (press/release)
 - 💡 **8 LEDs** — one per side button (lights on press, like a Stream Deck) plus
   two extra LEDs, all individually controllable
+- 🧩 **FIP-native apps** (`fipui.py`) — each page is an app combining rendering,
+  button/knob events, persistent LEDs and visual alerts
 - 📑 **5 built-in pages** (left knob cycles) — see below
 - ⌨️ **Opt-in keyboard bindings** — map `ctrl+shift+s`, `volumemute`, `win+d`…
   on any control. *Default: controls act only on the FIP's own pages, nothing
@@ -41,7 +43,7 @@ cd fipd
 python fipd3.py                            # -> http://127.0.0.1:8199
 ```
 
-## 📑 The five built-in pages
+## 📑 The six built-in pages
 
 ![FIP pages](docs/pages.png)
 
@@ -52,6 +54,7 @@ python fipd3.py                            # -> http://127.0.0.1:8199
 | **3 · Network** | Traffic counters + interface IPs |
 | **4 · Button tester** | S1–S6 light up on press, knobs & select states — instant feedback |
 | **5 · Reader** | Long text scrolled by the **right knob** (44 px/notch) with progress bar |
+| **6 · fipui demo** | Interactive menu: right knob = cursor, S1 = toggle/action, LEDs mirror item states, red alert banner with LED blink |
 
 Navigation is **bounded** (no wrap-around) and works from BOTH the left knob and
 the two page buttons between the knobs (firmware-driven, via a `PageChange`
@@ -116,6 +119,30 @@ real plugin inside the service to log its exact init sequence. The full story
 lives in [`fipd/README.md`](fipd/README.md) (French); reference wire captures in
 `fipd/startserver_session.log` and `fipd/proxy_log_copie.txt`.
 
+## 🧩 Write your own FIP app
+
+Pages are instances of `fipui.App` (see [`fipd/fipui.py`](fipd/fipui.py) — the
+built-ins and the demo app in `fipd/fipd3.py` are living examples):
+
+```python
+class MyApp(fipui.App):
+    name = 'myapp'
+    title = 'MY APP'
+    def on_enter(self):            # page becomes current
+        self.set_led(1, True)      # persistent LED (re-applied on page switches)
+    def on_event(self, name, pressed):
+        if pressed and name == 'S1':
+            self.alert('Hello!')   # banner + LED 8 blink, 3 s
+    def render(self, d):           # 320x240, background already painted
+        fipui.draw_header(d, F_MED, self.title)
+        fipui.draw_menu(d, F_MED, self.items, self.cursor, self.states)
+```
+
+The daemon handles everything hardware: current-page rule, single display
+thread (no RPC re-entrancy), keepalive, paging, keyboard bindings (an app
+yields a control when it's bound). `GET /apps` lists pages, `POST /page
+{"page":N}` switches.
+
 ## 💡 LEDs
 
 `DirectOutput_SetLed` follows the same **current-page** rule as `SetImage`.
@@ -126,8 +153,8 @@ states are per firmware page. Button-press lighting can be disabled with
 
 ## 🗺️ Roadmap
 
-- [ ] **FIP-native apps** — a small framework to build fully interactive pages
-      combining display, buttons, knobs and LEDs (widgets, focus, alerts…)
+- [ ] FIP apps: load third-party apps from an `apps/` directory (hot-load),
+      more widgets (sliders, spinners, charts)
 - [ ] Capture the exact wire bytes of the page-activation sequence → pure-Python
       `firmware_init()` (drop the Logitech stack entirely)
 - [ ] **Linux port** — libusb for the bulk interface (44-byte big-endian header

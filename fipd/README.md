@@ -47,9 +47,19 @@ select=0x01, R_CW/CCW=0x02/0x04, L_CW/CCW=0x10/0x08 (confirmés matériel 19/11)
   `ext\Saitek.FIP.dll` (UI WPF) + device raw dans SPAD.neXt.Devices.dll (obfusqué).
   SPAD streame des images rendues côté hôte (pas de serveur embarqué).
 
+## Applications fipui (20/11)
+Chaque page = une `fipui.App` (fipui.py) : `render(d)`, `on_event(name, pressed)`,
+`on_enter/on_leave`, `tick()`, LEDs persistantes (`set_led` re-aplique a l'entree,
+les tampons pages etant perdus au RemovePage+AddPage), alertes (`alert()` =
+bandeau rouge clignotant + LED 8, ~2 Hz). Widgets : `draw_header`, `draw_menu`,
+`draw_bar`. Le daemon gere : regle page courante, thread d'affichage unique,
+keepalive (0.3 s si alerte active), pagination, bindings (l'app cede un controle
+binde). 6 pages integrees dont la DEMO FIPUI (menu molette + toggles LED + alerte).
+API : GET /apps, POST /page {"page":N}.
+
 ## Reste à faire
-- **Applis 100% FIP** : mini-framework de pages interactives combinant ecran,
-  boutons, molettes et LEDs (widgets, focus, alertes visuelles).
+- **Applis** : chargement d'apps tierces depuis un dossier apps/ (hot-load),
+  widgets supplementaires (sliders, jauges animees).
 - **Init pur (pour Linux)** : capturer les bytes wire exacts de `AddPage(0,ACTIVE)`
   côté service — proxy DLL amélioré (logger TOUS les args de Create + hooker les
   WriteFile du vrai plugin via IAT) pendant un cycle service+client. Puis :

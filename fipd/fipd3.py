@@ -1,27 +1,24 @@
 """
 fipd v3 — Flight Instrument Panel : daemon generique via la pile officielle.
 
-Backend : DirectOutput.dll (client pipes) -> DirectOutputService (service Logitech,
-installe une fois pour toutes). Ecran + 6 boutons + 2 molettes, sans SPAD ni licence.
+Backend : DirectOutput.dll (client pipes) -> DirectOutputService (service Logitech).
+Pages = APPLICATIONS fipui (fipui.py) : rendu, boutons/molettes, LEDs persistantes,
+alertes. Pages integrees : Horloge, Systeme, Reseau, TEST boutons, Lecture, Demo.
 
-Prerequis : service DirectOutputService demarre (voir README).
-  (demarrage : sc start DirectOutputService  — droits admin)
-
-Pages integrees (molette gauche) :
-  1. Horloge   2. Systeme   3. Reseau   4. TEST boutons   5. Lecture (molette droite)
-
-Par defaut, les touches ne pilotent QUE les pages du FIP (rien n'est execute sur la
-machine). Opt-in uniquement : racourcis clavier via fipd_bindings.json (recharge a
-chaud) ou POST /bindings — ex. {"S1": "ctrl+shift+s"}.
+Par defaut les touches ne pilotent QUE le FIP ; racourcis clavier opt-in via
+fipd_bindings.json (recharge a chaud) ou POST /bindings.
 
 API http://127.0.0.1:8199 :
   POST /screen (PNG/JPG/BMP/WEBP ou ?url=)   affiche une image
   POST /video (fichier)                      joue une video (bouton S1 = stop)
   POST /ui                                   revient a l'interface integree
-  GET/POST /bindings                         racourcis clavier des boutons (JSON)
+  GET/POST /bindings                         racourcis clavier (JSON)
   GET /keys                                  noms de touches reconnus
+  POST /led {"index":1..8,"on":bool}         LED (ou {"scan":true})
   GET /buttons (SSE) /events /
 """
+import ctypes
+import ctypes.wintypes as wt
 import io
 import json
 import os
@@ -29,12 +26,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import ctypes
-import ctypes.wintypes as wt
+import fipui
+from fipui import App, draw_header, draw_menu, draw_bar
 
 PORT = 8199
-NBPAGES = 5
-FW_BASE = 1               # ids firmware des pages : 1..5 (convention exemple SDK)
+FW_BASE = 1               # ids firmware des pages : 1..N
 SCROLL_STEP = 44          # px par cran de molette (page Lecture)
 DO_DIR = r'C:\Program Files\Logitech\DirectOutput'
 
@@ -62,13 +58,12 @@ do.DirectOutput_RemovePage.argtypes = [VOID_P, wt.DWORD]
 do.DirectOutput_SetImage.argtypes = [VOID_P, wt.DWORD, wt.DWORD, wt.DWORD, VOID_P]
 do.DirectOutput_SetLed.argtypes = [VOID_P, wt.DWORD, wt.DWORD, wt.DWORD]
 
+import keysend
+
 SOFTBUTTONS = {0x01: 'select', 0x02: 'right_cw', 0x04: 'right_ccw', 0x08: 'left_ccw',
                0x10: 'left_cw', 0x20: 'S1', 0x40: 'S2', 0x80: 'S3',
                0x100: 'S4', 0x200: 'S5', 0x400: 'S6'}
-LED_OF = {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5, 'S6': 6}   # LEDs 7-8 : fixes
-
-import json
-import keysend
+LED_OF = {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5, 'S6': 6}   # LEDs 7-8 : libres
 
 BINDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fipd_bindings.json')
 
@@ -78,6 +73,22 @@ DEFAULT_BINDINGS = {
     'bindings': {n: None for n in SOFTBUTTONS.values()},
     'pages': {},
 }
+
+
+def load_font(size):
+    from PIL import ImageFont
+    for p in (r'C:\Windows\Fonts\consola.ttf', r'C:\Windows\Fonts\arial.ttf'):
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+F_BIG = load_font(44)
+F_MED = load_font(20)
+F_SML = load_font(14)
 
 
 class Bindings:
@@ -113,7 +124,6 @@ class Bindings:
             pass
 
     def active(self, mode, page):
-        """Ensemble effectif : global puis surcharge de la page courante (mode ui)."""
         self.reload()
         merged = dict(self.cfg.get('bindings', {}))
         if mode == 'ui':
@@ -121,7 +131,6 @@ class Bindings:
         return merged
 
     def dispatch(self, edges, mode, page):
-        """edges = {nom: True(appui) / False(relachement)} -> envoie les combos."""
         binds = self.active(mode, page)
         for name, pressed in edges.items():
             combo = binds.get(name)
@@ -143,322 +152,113 @@ class Bindings:
                 and not binds.get('left_cw') and not binds.get('left_ccw'))
 
 
-def load_font(size):
-    from PIL import ImageFont
-    for p in (r'C:\Windows\Fonts\consola.ttf', r'C:\Windows\Fonts\arial.ttf'):
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
+# ============================ APPLICATIONS integrees ============================
+
+class ClockApp(App):
+    name = 'clock'
+    title = 'HORLOGE'
+
+    def render(self, d):
+        d.text((160, 90), time.strftime('%H:%M:%S'), font=F_BIG,
+               fill=(255, 255, 255), anchor='mm')
+        d.text((160, 140), time.strftime('%A %d %B %Y'), font=F_MED,
+               fill=(180, 220, 255), anchor='mm')
 
 
-F_BIG = load_font(44)
-F_MED = load_font(20)
-F_SML = load_font(14)
+class SystemApp(App):
+    name = 'system'
+    title = 'SYSTEME'
+
+    def render(self, d):
+        import psutil
+        cpu = psutil.cpu_percent(interval=None)
+        mem = psutil.virtual_memory().percent
+        d.text((15, 12), 'SYSTEME', font=F_MED, fill=(255, 210, 80))
+        d.text((15, 45), 'CPU  {:5.1f} %'.format(cpu), font=F_MED, fill=(255, 255, 255))
+        draw_bar(d, 15, 75, 305, 87, cpu / 100, (80, 200, 120))
+        d.text((15, 105), 'RAM  {:5.1f} %'.format(mem), font=F_MED, fill=(255, 255, 255))
+        draw_bar(d, 15, 135, 305, 147, mem / 100, (200, 120, 80))
+        disk = psutil.disk_usage('C:').percent
+        d.text((15, 165), 'Disque C: {:.0f} %'.format(disk), font=F_SML,
+               fill=(200, 200, 200))
 
 
-class Daemon:
-    def __init__(self):
-        self.mode = 'ui'
-        self.page = 0
-        self.events = []
-        self.sse = []
-        self.lock = threading.RLock()
-        self.hdev = None
-        self.status = 'demarrage'
-        self.video_stop = threading.Event()
-        self.bindings = Bindings()
-        self._prev_btn = 0
-        self._scroll = 0          # offset page Lecture
-        self._txt_img = None      # cache du long texte pre-rendu
-        self._page_cb = None      # reference PageChange (GC)
-        self._draw_evt = threading.Event()   # redraw asynchrone (jamais de SetImage
-                                             # depuis un callback du service = reentrance)
-        self._gap_timer = None    # detection de l'ecran home Saitek (a sauter)
-        self._own_nav = False     # nos propres activations (ne pas detecter de trou)
+class NetworkApp(App):
+    name = 'network'
+    title = 'RESEAU'
 
-    # ---------- demarrage pile officielle ----------
+    def render(self, d):
+        import psutil
+        d.text((15, 12), 'RESEAU', font=F_MED, fill=(255, 210, 80))
+        y = 48
+        io2 = psutil.net_io_counters()
+        d.text((15, y), 'Envoyes {:8.1f} Mo'.format(io2.bytes_sent / 1e6),
+               font=F_SML, fill=(255, 255, 255))
+        y += 26
+        d.text((15, y), 'Recus   {:8.1f} Mo'.format(io2.bytes_recv / 1e6),
+               font=F_SML, fill=(255, 255, 255))
+        y += 34
+        for nm, addrs in list(psutil.net_if_addrs().items())[:4]:
+            ip = next((a.address for a in addrs if a.family.name == 'AF_INET'), None)
+            if ip:
+                d.text((15, y), '{:12s} {}'.format(nm[:12], ip),
+                       font=F_SML, fill=(170, 200, 170))
+                y += 22
 
-    def start(self, timeout=20):
-        hr = do.DirectOutput_Initialize('fipd')
-        if hr != 0:
-            self.status = f'Initialize hr=0x{hr & 0xFFFFFFFF:08X}'
-            return False
 
-        found = []
+class TesterApp(App):
+    """Testeur : S1-S6 + select/molettes, retour visuel immediat."""
+    name = 'tester'
+    title = 'TEST BOUTONS'
 
-        @ENUM_CB
-        def on_enum(h, ctx):
-            found.append(h)
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.state = 0              # masque boutons courant
 
-        do.DirectOutput_Enumerate(on_enum, None)
-        if not found:
-            self.status = 'aucun peripherique DirectOutput'
-            return False
-        self.hdev = found[0]
-
-        self._btn_cb = BTN_CB(self._on_btn)   # reference gardee : le service l'appellera
-        do.DirectOutput_RegisterSoftButtonCallback(self.hdev, self._btn_cb, None)
-        # PageChange : boutons page ↑/↓ du firmware (entre les molettes)
-        self._page_cb = PAGE_CB(self._on_page)
-        do.DirectOutput_RegisterPageCallback(self.hdev, self._page_cb, None)
-        # 5 pages firmware (ids 1..5) : les boutons ↑/↓ cyclent NOS pages,
-        # plus d'ecrans d'accueil Saitek.
-        # purge defensive : pages d'une session precedente mal terminee
-        self._own_nav = True                  # nos Add/Remove ne doivent pas armer
-        for i in range(NBPAGES):              # la detection d'ecran home
-            try:
-                do.DirectOutput_RemovePage(self.hdev, FW_BASE + i)
-            except OSError:
-                pass
-        time.sleep(0.3)
-        hrs = []
-        for i in range(NBPAGES):
-            hrs.append(do.DirectOutput_AddPage(self.hdev, FW_BASE + i, f'fipd{i+1}',
-                                               1 if i == 0 else 0))  # 1 = ACTIVE
-        # E_PAGENOTACTIVE : seul un dessin sur la page COURANTE est accepte.
-        # Les 5 pages sont enregistrees (boutons ↑/↓), puis on rend la 1re courante.
-        self._activate(0)
-        self.set_led(7, False)                # LEDs fixes (7-8) eteintes par defaut :
-        self.set_led(8, False)                # pilotables librement via POST /led
-        self._refresh_page(0)
-        time.sleep(0.5)                       # laisser fuiter les callbacks d'init
-        self._own_nav = False
-        self.status = (f'OK (device 0x{self.hdev:x}, pages ' +
-                       ' '.join(f'{h & 0xFFFFFFFF:08X}' for h in hrs) + ')')
-        threading.Thread(target=self._keepalive, daemon=True).start()
-        return True
-
-    # ---------- pages firmware ----------
-
-    def _refresh_page(self, page, img=None):
-        """Envoie le rendu de la page (0..4) vers son slot firmware (avec retry).
-        NE JAMAIS appeler depuis un callback du service (reentrance RPC)."""
-        if not self.hdev:
+    def on_event(self, name, pressed):
+        bit = next((b for b, n in SOFTBUTTONS.items() if n == name), None)
+        if bit is None:
             return
-        from PIL import Image
-        img = img if img is not None else self.render_page(page)
-        img = img.convert('RGB').resize((320, 240)).transpose(Image.FLIP_TOP_BOTTOM)
-        buf = ctypes.create_string_buffer(img.tobytes(), 320 * 240 * 3)
-        for attempt in range(3):
-            try:
-                with self.lock:
-                    do.DirectOutput_SetImage(self.hdev, FW_BASE + page, 0,
-                                             320 * 240 * 3, buf)
-                    if page == self.page:
-                        self._last_raw = buf
-                return
-            except OSError as e:
-                if attempt == 2:
-                    print(f'refresh page {page+1} echoue: '
-                          f'{e.winerror & 0xFFFFFFFF:08X}' if e.winerror else
-                          f'refresh page {page+1} echoue: {e}', flush=True)
-                time.sleep(0.25)
+        if pressed:
+            self.state |= bit
+        else:
+            self.state &= ~bit
 
-    def _activate(self, page):
-        """Rend la page COURANTE cote firmware. Empirique (probe_pages2) :
-        seul le dessin sur la page courante est accepte (FF040001 sinon) ;
-        AddPage rend la nouvelle page courante ; re-activer une page existante
-        exige RemovePage + AddPage. Le tampon image est perdu -> redraw apres."""
-        if not self.hdev:
-            return None
-        fw = FW_BASE + page
-        try:
-            do.DirectOutput_RemovePage(self.hdev, fw)
-        except OSError:
-            pass                      # page inconnue : premier enregistrement
-        time.sleep(0.03)
-        try:
-            do.DirectOutput_AddPage(self.hdev, fw, f'fipd{page + 1}', 1)
-            return 0
-        except OSError as e:
-            print(f'activate page {page+1} echoue: '
-                  f'{e.winerror & 0xFFFFFFFF:08X}' if e.winerror else
-                  f'activate page {page+1} echoue', flush=True)
-            return -1
+    def render(self, d):
+        d.text((160, 12), 'TEST BOUTONS', font=F_MED, fill=(255, 210, 80), anchor='mm')
+        boxes = [(0x20, 'S1'), (0x40, 'S2'), (0x80, 'S3'),
+                 (0x100, 'S4'), (0x200, 'S5'), (0x400, 'S6')]
+        bw, bh, gap, x0, y0 = 92, 52, 12, 10, 30
+        for i, (bit, name) in enumerate(boxes):
+            x = x0 + (i % 3) * (bw + gap)
+            y = y0 + (i // 3) * (bh + 10)
+            on = self.state & bit
+            if on:
+                d.rectangle((x, y, x + bw, y + bh), fill=(70, 200, 120),
+                            outline=(180, 255, 200))
+                d.text((x + bw // 2, y + bh // 2), name, font=F_MED,
+                       fill=(10, 30, 16), anchor='mm')
+            else:
+                d.rectangle((x, y, x + bw, y + bh), outline=(90, 95, 110))
+                d.text((x + bw // 2, y + bh // 2), name, font=F_MED,
+                       fill=(150, 155, 170), anchor='mm')
+        mini = [(0x01, 'SEL'), (0x10, 'L>'), (0x08, '<L'), (0x02, 'R>'), (0x04, '<R')]
+        x = 12
+        for bit, lab in mini:
+            on = self.state & bit
+            d.rectangle((x, 158, x + 52, 178),
+                        fill=(60, 90, 160) if on else None,
+                        outline=(90, 95, 110) if not on else (150, 180, 255))
+            d.text((x + 26, 168), lab, font=F_SML,
+                   fill=(235, 240, 255) if on else (140, 145, 160), anchor='mm')
+            x += 60
 
-    def _switch_page(self, new):
-        """Navigation molette gauche : bornee (pas de bouclage).
-        Appelle depuis le callback boutons -> programmation asynchrone."""
-        new = max(0, min(NBPAGES - 1, new))
-        if new == self.page:
-            return
-        self.page = new
-        self._scroll = 0
-        self._pending_activate = new          # le thread d'affichage activera + dessinera
-        self._draw_evt.set()
 
-    def _cancel_gap(self):
-        if self._gap_timer is not None:
-            self._gap_timer.cancel()
-            self._gap_timer = None
-
-    def _arm_gap(self, idx):
-        """Apres la desactivation de la page idx sans activation qui suit :
-        le firmware est tombe sur son ecran home (Saitek) -> on saute au
-        prolongement du cycle (home est sur l'axe 1<->5)."""
-        self._cancel_gap()
-        if idx not in (0, NBPAGES - 1):
-            return
-
-        def skip_home():
-            target = NBPAGES - 1 if idx == 0 else 0
-            self._gap_timer = None
-            if self._own_nav or self.page != idx:
-                return
-            self._scroll = 0
-            self.page = target
-            self._pending_activate = target
-            self._draw_evt.set()
-            print(f'[page] home Saitek saute -> page {target + 1}', flush=True)
-
-        self._gap_timer = threading.Timer(0.05, skip_home)
-        self._gap_timer.daemon = True
-        self._gap_timer.start()
-
-    def _on_page(self, h, fwpage, active, ctx):
-        """Callback firmware : boutons page ↑/↓ (entre les molettes).
-        AUCUN appel DirectOutput ici (reentrance) : on programme le redraw."""
-        idx = fwpage - FW_BASE
-        if fwpage < 0x80000000:              # ids plausibles seulement (pas les -1)
-            print(f'[page] t={time.time():.3f} fw={fwpage} active={bool(active)} '
-                  f'idx={idx}', flush=True)
-        if not (0 <= idx < NBPAGES):
-            return
-        if active:
-            self._cancel_gap()
-            if idx != self.page:
-                self._scroll = 0
-                self.page = idx
-            self.mode = 'ui'                  # les boutons ↑/↓ reviennent au dashboard
-            self._draw_evt.set()              # le thread d'affichage dessinera
-            ev = {'t': time.time(), 'state': 0, 'names': ['page_updown'], 'page': idx}
-            self.events.append(ev)
-            self.events = self.events[-200:]
-            for q in list(self.sse):
-                try:
-                    q.append(ev)
-                except Exception:
-                    self.sse.remove(q)
-        elif not self._own_nav:
-            self._arm_gap(idx)
-
-    def _on_btn(self, h, buttons, ctx):
-        names = [n for b, n in SOFTBUTTONS.items() if buttons & b]
-        ev = {'t': time.time(), 'state': buttons, 'names': names, 'page': self.page}
-        self.events.append(ev)
-        self.events = self.events[-200:]
-        for q in list(self.sse):
-            try:
-                q.append(ev)
-            except Exception:
-                self.sse.remove(q)
-
-        # arret video : S1 en mode video (prioritaire sur les bindings)
-        if self.mode == 'video' and buttons & 0x20 and not self._prev_btn & 0x20:
-            self.video_stop.set()
-
-        # edges : appuis / relachements
-        pressed = buttons & ~self._prev_btn
-        released = self._prev_btn & ~buttons
-        self._prev_btn = buttons
-        edges = {}
-        for bit, n in SOFTBUTTONS.items():
-            if pressed & bit:
-                edges[n] = True
-            elif released & bit:
-                edges[n] = False
-        if edges:
-            self.bindings.dispatch(edges, self.mode, self.page)
-            # retour lumineux : LED du bouton pendant l'appui (local au FIP)
-            if self.bindings.cfg.get('led_feedback', True):
-                for name, pressed in edges.items():
-                    led = LED_OF.get(name)
-                    if led:
-                        self.set_led(led, pressed)
-
-        # actions internes (pages du FIP) — par defaut les touches restent locales
-        if self.mode == 'ui':
-            binds = self.bindings.active(self.mode, self.page)
-            if self.bindings.paging_enabled(self.mode, self.page):
-                if edges.get('left_ccw'):
-                    self._switch_page(self.page + 1)      # borne, pas de bouclage
-                elif edges.get('left_cw'):
-                    self._switch_page(self.page - 1)
-            if self.page == 4:
-                # molette droite = defilement du texte (sauf si bindee clavier)
-                if not binds.get('right_cw') and edges.get('right_cw'):
-                    self._scroll = min(self._scroll + SCROLL_STEP, self._text_max())
-                elif not binds.get('right_ccw') and edges.get('right_ccw'):
-                    self._scroll = max(self._scroll - SCROLL_STEP, 0)
-            if self.page in (3, 4) and edges:
-                self._redraw_now()      # retour visuel immediat
-
-    # ---------- affichage ----------
-
-    def _send(self, img):
-        """Modes image/video : ecrit sur la page firmware 1."""
-        from PIL import Image
-        img = img.convert('RGB').resize((320, 240)).transpose(Image.FLIP_TOP_BOTTOM)
-        buf = ctypes.create_string_buffer(img.tobytes(), 320 * 240 * 3)
-        with self.lock:                      # callback boutons + keepalive serrialises
-            self._last_raw = buf
-            do.DirectOutput_SetImage(self.hdev, FW_BASE, 0, 320 * 240 * 3, buf)
-
-    def set_led(self, index, on):
-        """LED d'un bouton lateral, sur la page COURANTE (regle E_PAGENOTACTIVE).
-        Retourne le hr pour diagnostic."""
-        try:
-            return do.DirectOutput_SetLed(self.hdev, FW_BASE + self.page,
-                                          index, 1 if on else 0) & 0xFFFFFFFF
-        except OSError as e:
-            return (e.winerror or 0) & 0xFFFFFFFF
-
-    def scan_leds(self):
-        """Balaie indices 0..12 on/off (400 ms) : l'utilisateur guette une lumiere."""
-        results = {}
-        for idx in list(range(0, 13)):
-            results[f'led{idx}_on'] = self.set_led(idx, True)
-            time.sleep(0.4)
-            self.set_led(idx, False)
-            time.sleep(0.2)
-        return results
-
-    def _redraw_now(self):
-        """Programme un redraw immediat (thread d'affichage)."""
-        self._draw_evt.set()
-
-    def show_image(self, img, mode='image'):
-        self.mode = mode
-        self._send(img)
-
-    def _keepalive(self):
-        """Thread d'affichage unique : tous les appels DirectOutput de dessin passent
-        ici (les callbacks du service ne font que programmer via _draw_evt)."""
-        while True:
-            self._draw_evt.wait(2.0)          # keepalive : redraw au plus tard /2 s
-            self._draw_evt.clear()
-            if not self.hdev:
-                continue
-            try:
-                if self.mode == 'ui':
-                    pend = getattr(self, '_pending_activate', None)
-                    if pend is not None:
-                        self._pending_activate = None
-                        self._own_nav = True
-                        try:
-                            self._activate(pend)
-                        finally:
-                            self._own_nav = False
-                    self._refresh_page(self.page)
-                elif getattr(self, '_last_raw', None):
-                    with self.lock:
-                        do.DirectOutput_SetImage(self.hdev, FW_BASE, 0,
-                                                 320 * 240 * 3, self._last_raw)
-            except Exception:
-                pass
+class ReaderApp(App):
+    """Long texte defilant a la molette droite."""
+    name = 'reader'
+    title = 'JOURNAL'
+    show_footer = False
 
     LONG_TEXT = (
         "FIPd — journal du driver maison\n"
@@ -493,16 +293,36 @@ class Daemon:
         "respondent, les molettes pulsent cran par cran. Le daemon v3 ne depend "
         "plus de rien de payant.\n"
         "\n"
+        "20/11/2026 — Les LEDs se revelent : SetLed devait simplement viser la "
+        "page COURANTE. Huit LED pilotables, une par bouton. Les applications "
+        "fipui naissent : chaque page possede son rendu, ses evenements, ses "
+        "LEDs persistantes et ses alertes.\n"
+        "\n"
         "Prochaines etapes : capturer les octets exacts de l'activation de page "
         "pour s'affranchir totalement de la pile Logitech sous Windows, puis "
         "porter le pilote pur sous Linux (libusb + hidraw). L'aventure continue."
     )
 
-    def _text_img(self):
-        """Le long texte pre-rendu une fois en image haute (cachee)."""
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.scroll = 0
+        self._img = None
+
+    def on_enter(self):
+        self.apply_leds()
+
+    def on_event(self, name, pressed):
+        if not pressed:
+            return
+        if name == 'right_cw':
+            self.scroll = min(self.scroll + SCROLL_STEP, self.text_max())
+        elif name == 'right_ccw':
+            self.scroll = max(self.scroll - SCROLL_STEP, 0)
+
+    def text_img(self):
         import textwrap
         from PIL import Image, ImageDraw
-        if self._txt_img is None:
+        if self._img is None:
             lines = []
             for para in self.LONG_TEXT.split('\n'):
                 lines += textwrap.wrap(para, width=44) or ['']
@@ -513,106 +333,425 @@ class Daemon:
             for ln in lines:
                 d.text((10, y), ln, font=F_SML, fill=(222, 226, 235))
                 y += 17
-            self._txt_img = img
-        return self._txt_img
+            self._img = img
+        return self._img
 
-    def _text_max(self):
-        return max(0, self._text_img().height - 212)
+    def text_max(self):
+        return max(0, self.text_img().height - 212)
 
-    def _render_buttons_test(self, d):
-        """Page 4 : testeur S1-S6 + etat select/molettes, retour visuel live."""
-        d.text((160, 12), 'TEST BOUTONS', font=F_MED, fill=(255, 210, 80), anchor='mm')
-        boxes = [(0x20, 'S1'), (0x40, 'S2'), (0x80, 'S3'),
-                 (0x100, 'S4'), (0x200, 'S5'), (0x400, 'S6')]
-        bw, bh, gap, x0, y0 = 92, 52, 12, 10, 30
-        for i, (bit, name) in enumerate(boxes):
-            x = x0 + (i % 3) * (bw + gap)
-            y = y0 + (i // 3) * (bh + 10)
-            on = self._prev_btn & bit
-            if on:
-                d.rectangle((x, y, x + bw, y + bh), fill=(70, 200, 120),
-                            outline=(180, 255, 200))
-                d.text((x + bw // 2, y + bh // 2), name, font=F_MED,
-                       fill=(10, 30, 16), anchor='mm')
-            else:
-                d.rectangle((x, y, x + bw, y + bh), outline=(90, 95, 110))
-                d.text((x + bw // 2, y + bh // 2), name, font=F_MED,
-                       fill=(150, 155, 170), anchor='mm')
-        mini = [(0x01, 'SEL'), (0x10, 'L>'), (0x08, '<L'), (0x02, 'R>'), (0x04, '<R')]
-        x = 12
-        for bit, lab in mini:
-            on = self._prev_btn & bit
-            d.rectangle((x, 158, x + 52, 178),
-                        fill=(60, 90, 160) if on else None,
-                        outline=(90, 95, 110) if not on else (150, 180, 255))
-            d.text((x + 26, 168), lab, font=F_SML,
-                   fill=(235, 240, 255) if on else (140, 145, 160), anchor='mm')
-            x += 60
+    def render(self, d):
+        pass          # ReaderApp utilise render_full() (scroll = paste + crop)
 
-    def _render_reader(self):
-        """Page 5 : long texte defilant (molette droite) + barre de progression."""
-        from PIL import Image, ImageDraw
-        base = Image.new('RGB', (320, 240), (12, 14, 20))
-        d = ImageDraw.Draw(base)
+    def render_full(self, img):
+        """Rendu complet (necessite paste, pas seulement ImageDraw)."""
+        from PIL import ImageDraw
+        d = ImageDraw.Draw(img)
         d.rectangle((0, 0, 319, 19), fill=(24, 28, 40))
         d.text((8, 10), 'JOURNAL', font=F_MED, fill=(255, 210, 80), anchor='lm')
         d.text((312, 10), 'molette droite', font=F_SML, fill=(130, 135, 150),
                anchor='rm')
-        win = self._text_img().crop((0, self._scroll, 320, self._scroll + 212))
-        base.paste(win, (0, 20))
-        # barre de progression a droite
-        mx = self._text_max()
+        win = self.text_img().crop((0, self.scroll, 320, self.scroll + 212))
+        img.paste(win, (0, 20))
+        mx = self.text_max()
         if mx > 0:
             d.rectangle((314, 24, 318, 228), outline=(70, 75, 90))
             th = max(8, int(204 * 212 / (mx + 212)))
-            ty = 24 + int((204 - th) * self._scroll / mx)
+            ty = 24 + int((204 - th) * self.scroll / mx)
             d.rectangle((315, ty, 317, ty + th), fill=(90, 160, 230))
-        return base
+
+
+class SettingsDemoApp(App):
+    """Demo fipui : menu a la molette, toggles a LEDs persistantes, alerte."""
+    name = 'demo'
+    title = 'DEMO FIPUI'
+
+    ITEMS = ['WiFi', 'Bluetooth', 'Mode sombre', 'Notifications', 'Veille auto',
+             'Redemarrer']
+
+    def __init__(self, daemon):
+        super().__init__(daemon)
+        self.cursor = 0
+        self.states = {0: True, 1: False, 2: True, 3: True, 4: False}
+
+    def on_enter(self):
+        self.sync_leds()
+        self.apply_leds()
+
+    def sync_leds(self):
+        for i, on in self.states.items():
+            self.leds[i + 1] = on
+
+    def on_event(self, name, pressed):
+        if not pressed:
+            return
+        if name == 'right_cw':
+            self.cursor = min(self.cursor + 1, len(self.ITEMS) - 1)
+        elif name == 'right_ccw':
+            self.cursor = max(self.cursor - 1, 0)
+        elif name in ('S1', 'select'):
+            if self.ITEMS[self.cursor] == 'Redemarrer':
+                self.alert('Redemarrage !')
+            else:
+                self.states[self.cursor] = not self.states[self.cursor]
+                self.set_led(self.cursor + 1, self.states[self.cursor])
+
+    def render(self, d):
+        draw_header(d, F_MED, self.title, 'S1: agir')
+        draw_menu(d, F_MED, self.ITEMS, self.cursor, self.states, y0=36)
+        d.text((160, 228), 'molette droite = curseur', font=F_SML,
+               fill=(120, 120, 130), anchor='mm')
+
+
+# ================================ Daemon ================================
+
+class Daemon:
+    def __init__(self):
+        self.mode = 'ui'
+        self.page = 0
+        self.events = []
+        self.sse = []
+        self.lock = threading.RLock()
+        self.hdev = None
+        self.status = 'demarrage'
+        self.video_stop = threading.Event()
+        self.bindings = Bindings()
+        self._prev_btn = 0
+        self._page_cb = None      # reference PageChange (GC)
+        self._draw_evt = threading.Event()   # redraw asynchrone (jamais de SetImage
+                                             # depuis un callback du service = reentrance)
+        self._gap_timer = None    # detection de l'ecran home Saitek (a sauter)
+        self._own_nav = False     # nos propres activations (ne pas detecter de trou)
+        self.apps = [ClockApp(self), SystemApp(self), NetworkApp(self),
+                     TesterApp(self), ReaderApp(self), SettingsDemoApp(self)]
+
+    def _npages(self):
+        return len(self.apps)
+
+    # ---------- demarrage pile officielle ----------
+
+    def start(self, timeout=20):
+        hr = do.DirectOutput_Initialize('fipd')
+        if hr != 0:
+            self.status = f'Initialize hr=0x{hr & 0xFFFFFFFF:08X}'
+            return False
+
+        found = []
+
+        @ENUM_CB
+        def on_enum(h, ctx):
+            found.append(h)
+
+        do.DirectOutput_Enumerate(on_enum, None)
+        if not found:
+            self.status = 'aucun peripherique DirectOutput'
+            return False
+        self.hdev = found[0]
+
+        self._btn_cb = BTN_CB(self._on_btn)   # reference gardee : le service l'appellera
+        do.DirectOutput_RegisterSoftButtonCallback(self.hdev, self._btn_cb, None)
+        # PageChange : boutons page ↑/↓ du firmware (entre les molettes)
+        self._page_cb = PAGE_CB(self._on_page)
+        do.DirectOutput_RegisterPageCallback(self.hdev, self._page_cb, None)
+        # purge defensive : pages d'une session precedente mal terminee
+        self._own_nav = True                  # nos Add/Remove ne doivent pas armer
+        for i in range(self._npages()):       # la detection d'ecran home
+            try:
+                do.DirectOutput_RemovePage(self.hdev, FW_BASE + i)
+            except OSError:
+                pass
+        time.sleep(0.3)
+        hrs = []
+        for i in range(self._npages()):
+            hrs.append(do.DirectOutput_AddPage(self.hdev, FW_BASE + i,
+                                               f'fipd-{self.apps[i].name}',
+                                               1 if i == 0 else 0))  # 1 = ACTIVE
+        # E_PAGENOTACTIVE : seul un dessin sur la page COURANTE est accepte.
+        # Toutes les pages sont enregistrees (boutons ↑/↓), puis la 1re est courante.
+        self._activate(0)
+        self.set_led(7, False)                # LEDs fixes (7-8) eteintes par defaut :
+        self.set_led(8, False)                # pilotables librement via POST /led
+        self._refresh_page(0)
+        time.sleep(0.5)                       # laisser fuiter les callbacks d'init
+        self._own_nav = False
+        self.status = (f'OK (device 0x{self.hdev:x}, {self._npages()} pages: ' +
+                       ' '.join(f'{h & 0xFFFFFFFF:08X}' for h in hrs) + ')')
+        threading.Thread(target=self._keepalive, daemon=True).start()
+        return True
+
+    # ---------- pages firmware ----------
+
+    def _refresh_page(self, page, img=None):
+        """Envoie le rendu de la page vers son slot firmware (avec retry).
+        NE JAMAIS appeler depuis un callback du service (reentrance RPC)."""
+        if not self.hdev:
+            return
+        from PIL import Image
+        img = img if img is not None else self.render_page(page)
+        img = img.convert('RGB').resize((320, 240)).transpose(Image.FLIP_TOP_BOTTOM)
+        buf = ctypes.create_string_buffer(img.tobytes(), 320 * 240 * 3)
+        for attempt in range(3):
+            try:
+                with self.lock:
+                    do.DirectOutput_SetImage(self.hdev, FW_BASE + page, 0,
+                                             320 * 240 * 3, buf)
+                    if page == self.page:
+                        self._last_raw = buf
+                return
+            except OSError as e:
+                if attempt == 2:
+                    msg = (f'refresh page {page+1} echoue: {e.winerror & 0xFFFFFFFF:08X}'
+                           if e.winerror else f'refresh page {page+1} echoue: {e}')
+                    print(msg, flush=True)
+                time.sleep(0.25)
+
+    def _activate(self, page):
+        """Rend la page COURANTE cote firmware. Empirique (probe_pages2) :
+        seul le dessin sur la page courante est accepte (FF040001 sinon) ;
+        AddPage rend la nouvelle page courante ; re-activer une page existante
+        exige RemovePage + AddPage. Le tampon image est perdu -> redraw apres."""
+        if not self.hdev:
+            return None
+        fw = FW_BASE + page
+        try:
+            do.DirectOutput_RemovePage(self.hdev, fw)
+        except OSError:
+            pass                      # page inconnue : premier enregistrement
+        time.sleep(0.03)
+        try:
+            do.DirectOutput_AddPage(self.hdev, fw, f'fipd-{self.apps[page].name}', 1)
+            return 0
+        except OSError as e:
+            print(f'activate page {page+1} echoue: '
+                  f'{e.winerror & 0xFFFFFFFF:08X}' if e.winerror else
+                  f'activate page {page+1} echoue', flush=True)
+            return -1
+
+    def _switch_page(self, new):
+        """Navigation molette gauche : bornee (pas de bouclage).
+        Appelle depuis le callback boutons -> programmation asynchrone."""
+        new = max(0, min(self._npages() - 1, new))
+        if new == self.page:
+            return
+        self.apps[self.page].on_leave()
+        self.page = new
+        self._pending_activate = new          # le thread d'affichage activera + dessinera
+        self._draw_evt.set()
+
+    def _enter_app(self, idx):
+        """Cycle d'entree : LEDs persistantes re-appliquees (tampons perdus)."""
+        try:
+            self.apps[idx].on_enter()
+        except Exception as e:
+            print(f'on_enter({idx}): {e}', flush=True)
+
+    def _cancel_gap(self):
+        if self._gap_timer is not None:
+            self._gap_timer.cancel()
+            self._gap_timer = None
+
+    def _arm_gap(self, idx):
+        """Apres la desactivation de la page idx sans activation qui suit :
+        le firmware est tombe sur son ecran home (Saitek) -> on saute au
+        prolongement du cycle (home est sur l'axe 1<->N)."""
+        self._cancel_gap()
+        if idx not in (0, self._npages() - 1):
+            return
+
+        def skip_home():
+            target = self._npages() - 1 if idx == 0 else 0
+            self._gap_timer = None
+            if self._own_nav or self.page != idx:
+                return
+            self.apps[idx].on_leave()
+            self.page = target
+            self._pending_activate = target
+            self._draw_evt.set()
+            print(f'[page] home Saitek saute -> page {target + 1}', flush=True)
+
+        self._gap_timer = threading.Timer(0.05, skip_home)
+        self._gap_timer.daemon = True
+        self._gap_timer.start()
+
+    def _on_page(self, h, fwpage, active, ctx):
+        """Callback firmware : boutons page ↑/↓ (entre les molettes).
+        AUCUN appel DirectOutput ici (reentrance) : on programme le redraw."""
+        idx = fwpage - FW_BASE
+        if fwpage < 0x80000000:              # ids plausibles seulement (pas les -1)
+            print(f'[page] t={time.time():.3f} fw={fwpage} active={bool(active)} '
+                  f'idx={idx}', flush=True)
+        if not (0 <= idx < self._npages()):
+            return
+        if active:
+            self._cancel_gap()
+            if idx != self.page:
+                self.apps[self.page].on_leave()
+                self.page = idx
+            self.mode = 'ui'                  # les boutons ↑/↓ reviennent au dashboard
+            self._enter_app(idx)
+            self._draw_evt.set()              # le thread d'affichage dessinera
+            ev = {'t': time.time(), 'state': 0, 'names': ['page_updown'], 'page': idx}
+            self.events.append(ev)
+            self.events = self.events[-200:]
+            for q in list(self.sse):
+                try:
+                    q.append(ev)
+                except Exception:
+                    self.sse.remove(q)
+        elif not self._own_nav:
+            self._arm_gap(idx)
+
+    # ---------- boutons ----------
+
+    def _on_btn(self, h, buttons, ctx):
+        names = [n for b, n in SOFTBUTTONS.items() if buttons & b]
+        ev = {'t': time.time(), 'state': buttons, 'names': names, 'page': self.page}
+        self.events.append(ev)
+        self.events = self.events[-200:]
+        for q in list(self.sse):
+            try:
+                q.append(ev)
+            except Exception:
+                self.sse.remove(q)
+
+        # arret video : S1 en mode video (prioritaire sur les bindings)
+        if self.mode == 'video' and buttons & 0x20 and not self._prev_btn & 0x20:
+            self.video_stop.set()
+
+        # edges : appuis / relachements
+        pressed = buttons & ~self._prev_btn
+        released = self._prev_btn & ~buttons
+        self._prev_btn = buttons
+        edges = {}
+        for bit, n in SOFTBUTTONS.items():
+            if pressed & bit:
+                edges[n] = True
+            elif released & bit:
+                edges[n] = False
+        if edges:
+            self.bindings.dispatch(edges, self.mode, self.page)
+            # retour lumineux : LED du bouton pendant l'appui (local au FIP)
+            app = self.apps[self.page]
+            fb = app.led_feedback
+            if fb is None:
+                fb = self.bindings.cfg.get('led_feedback', True)
+            if fb:
+                for name, was_pressed in edges.items():
+                    led = LED_OF.get(name)
+                    if led:
+                        self.set_led(led, was_pressed)
+
+        # actions internes (pages du FIP) — par defaut les touches restent locales
+        if self.mode == 'ui':
+            binds = self.bindings.active(self.mode, self.page)
+            if self.bindings.paging_enabled(self.mode, self.page):
+                if edges.get('left_ccw'):
+                    self._switch_page(self.page + 1)      # borne, pas de bouclage
+                elif edges.get('left_cw'):
+                    self._switch_page(self.page - 1)
+            # evenements remis a l'app courante (apres pagination eventuelle)
+            app = self.apps[self.page]
+            for name, was_pressed in edges.items():
+                if binds.get(name):
+                    continue          # controle binde clavier : l'app cede
+                try:
+                    app.on_event(name, was_pressed)
+                except Exception as e:
+                    print(f'on_event({name}): {e}', flush=True)
+            self._redraw_now()        # retour visuel immediat
+
+    # ---------- LEDs ----------
+
+    def set_led(self, index, on):
+        """LED d'un bouton lateral, sur la page COURANTE (regle E_PAGENOTACTIVE).
+        Retourne le hr pour diagnostic."""
+        try:
+            return do.DirectOutput_SetLed(self.hdev, FW_BASE + self.page,
+                                          index, 1 if on else 0) & 0xFFFFFFFF
+        except OSError as e:
+            return (e.winerror or 0) & 0xFFFFFFFF
+
+    def scan_leds(self):
+        """Balaie indices 0..12 on/off (400 ms) : l'utilisateur guette une lumiere."""
+        results = {}
+        for idx in list(range(0, 13)):
+            results[f'led{idx}_on'] = self.set_led(idx, True)
+            time.sleep(0.4)
+            self.set_led(idx, False)
+            time.sleep(0.2)
+        return results
+
+    # ---------- affichage ----------
 
     def render_page(self, page=None):
-        page = self.page if page is None else page
-        import psutil
+        """Rendu PIL d'une page (fond + app + alerte + footer)."""
         from PIL import Image, ImageDraw
-        img = Image.new('RGB', (320, 240), (18, 22, 38))
+        page = self.page if page is None else page
+        app = self.apps[page]
+        img = Image.new('RGB', (320, 240), fipui.BG)
         d = ImageDraw.Draw(img)
-        if page == 0:
-            d.text((160, 90), time.strftime('%H:%M:%S'), font=F_BIG,
-                   fill=(255, 255, 255), anchor='mm')
-            d.text((160, 140), time.strftime('%A %d %B %Y'), font=F_MED,
-                   fill=(180, 220, 255), anchor='mm')
-        elif page == 1:
-            cpu = psutil.cpu_percent(interval=None)
-            mem = psutil.virtual_memory().percent
-            d.text((15, 12), 'SYSTEME', font=F_MED, fill=(255, 210, 80))
-            d.text((15, 45), 'CPU  {:5.1f} %'.format(cpu), font=F_MED, fill=(255, 255, 255))
-            d.rectangle((15, 75, 305, 87), outline=(90, 90, 90))
-            d.rectangle((15, 75, 15 + int(290 * cpu / 100), 87), fill=(80, 200, 120))
-            d.text((15, 105), 'RAM  {:5.1f} %'.format(mem), font=F_MED, fill=(255, 255, 255))
-            d.rectangle((15, 135, 305, 147), outline=(90, 90, 90))
-            d.rectangle((15, 135, 15 + int(290 * mem / 100), 147), fill=(200, 120, 80))
-        elif page == 2:
-            d.text((15, 12), 'RESEAU', font=F_MED, fill=(255, 210, 80))
-            y = 48
-            io2 = psutil.net_io_counters()
-            d.text((15, y), 'Envoyes {:8.1f} Mo'.format(io2.bytes_sent / 1e6),
-                   font=F_SML, fill=(255, 255, 255))
-            y += 26
-            d.text((15, y), 'Recus   {:8.1f} Mo'.format(io2.bytes_recv / 1e6),
-                   font=F_SML, fill=(255, 255, 255))
-            y += 34
-            for nm, addrs in list(psutil.net_if_addrs().items())[:4]:
-                ip = next((a.address for a in addrs if a.family.name == 'AF_INET'), None)
-                if ip:
-                    d.text((15, y), '{:12s} {}'.format(nm[:12], ip),
-                           font=F_SML, fill=(170, 200, 170))
-                    y += 22
-        elif page == 3:
-            self._render_buttons_test(d)
+        if isinstance(app, ReaderApp):
+            app.render_full(img)             # necessite paste (scroll)
         else:
-            return self._render_reader()
-        d.text((160, 228), 'page {}/{}  (molette gauche)'.format(page + 1, NBPAGES),
-               font=F_SML, fill=(120, 120, 130), anchor='mm')
+            app.render(d)
+            app.draw_alert(d, F_MED)
+            if app.show_footer:
+                d.text((160, 228), 'page {}/{}  (molette gauche)'.format(
+                    page + 1, self._npages()), font=F_SML,
+                    fill=(120, 120, 130), anchor='mm')
         return img
+
+    def _send(self, img):
+        """Modes image/video : ecrit sur la page firmware 1."""
+        from PIL import Image
+        img = img.convert('RGB').resize((320, 240)).transpose(Image.FLIP_TOP_BOTTOM)
+        buf = ctypes.create_string_buffer(img.tobytes(), 320 * 240 * 3)
+        with self.lock:                      # callback boutons + keepalive serrialises
+            self._last_raw = buf
+            do.DirectOutput_SetImage(self.hdev, FW_BASE, 0, 320 * 240 * 3, buf)
+
+    def _redraw_now(self):
+        """Programme un redraw immediat (thread d'affichage)."""
+        self._draw_evt.set()
+
+    def show_image(self, img, mode='image'):
+        self.mode = mode
+        self._send(img)
+
+    def _keepalive(self):
+        """Thread d'affichage unique : tous les appels DirectOutput de dessin passent
+        ici (les callbacks du service ne font que programmer via _draw_evt)."""
+        while True:
+            app = self.apps[self.page] if self.mode == 'ui' else None
+            fast = bool(app and app.alert_active())
+            self._draw_evt.wait(0.3 if fast else 2.0)
+            self._draw_evt.clear()
+            if not self.hdev:
+                continue
+            try:
+                if self.mode == 'ui':
+                    app = self.apps[self.page]
+                    try:
+                        app.tick()
+                    except Exception:
+                        pass
+                    pend = getattr(self, '_pending_activate', None)
+                    if pend is not None:
+                        self._pending_activate = None
+                        self._own_nav = True
+                        try:
+                            self._activate(pend)
+                        finally:
+                            self._own_nav = False
+                        self._enter_app(pend)    # tampons perdus : LEDs a re-appliquer
+                    self._refresh_page(self.page)
+                elif getattr(self, '_last_raw', None):
+                    with self.lock:
+                        do.DirectOutput_SetImage(self.hdev, FW_BASE, 0,
+                                                 320 * 240 * 3, self._last_raw)
+            except Exception:
+                pass
+
+    # ---------- video ----------
 
     def play_video(self, path, fps=14):
         import cv2
@@ -678,14 +817,19 @@ class H(BaseHTTPRequestHandler):
         elif self.path == '/keys':
             self._json({'keys': keysend.key_names(),
                         'exemple': 'ctrl+shift+s, volumemute, f5, alt+tab'})
+        elif self.path == '/apps':
+            self._json({'apps': [{'index': i, 'name': a.name, 'title': a.title}
+                                 for i, a in enumerate(D.apps)],
+                        'page': D.page})
         elif self.path == '/':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
             body = ('<html><body style="font-family:sans-serif;background:#111;color:#eee">'
                     '<h2>FIPd v3</h2><p>Status : ' + D.status + '</p><p>Mode : ' + D.mode +
-                    '</p><p>POST /screen (image) - POST /video - POST /ui - '
-                    'GET /buttons (SSE)</p></body></html>').encode()
+                    '</p><p>Page : ' + str(D.page + 1) + '/' + str(D._npages()) + '</p>'
+                    '<p>POST /screen (image) - POST /video - POST /ui - POST /led - '
+                    'GET /buttons (SSE) - GET /apps</p></body></html>').encode()
             self.wfile.write(body)
         else:
             self._json({'error': 'inconnu'}, 404)
@@ -721,12 +865,16 @@ class H(BaseHTTPRequestHandler):
                 hr = D.set_led(idx, on)
                 return self._json({'ok': hr == 0, 'index': idx, 'on': on,
                                    'hr': f'{hr:08X}', 'page': D.page})
+            if self.path == '/page':
+                dd = json.loads(body or b'{}')
+                D.mode = 'ui'
+                D._switch_page(max(0, min(D._npages() - 1, int(dd.get('page', 0)))))
+                return self._json({'ok': True, 'page': D.page})
             if self.path == '/bindings':
                 try:
                     cfg = json.loads(body)
                 except Exception as e:
                     return self._json({'error': f'json invalide: {e}'}, 400)
-                # validation : chaque combo doit se parser
                 for scope in [cfg.get('bindings', {})] + list(cfg.get('pages', {}).values()):
                     for name, combo in scope.items():
                         if combo and name not in SOFTBUTTONS.values():
@@ -754,8 +902,9 @@ def main():
         sys.exit(1)
     atexit.register(lambda: (setattr(D, 'hdev', None),
                              do.DirectOutput_Deinitialize()))   # libere nos pages
-    print('Pret : http://127.0.0.1:8199 —', D.status, flush=True)
-    print('Interface integree : molette GAUCHE = page. S1 = stop video.', flush=True)
+    print(f'Pret : http://127.0.0.1:8199 — {D.status}', flush=True)
+    print(f'{D._npages()} applications : ' + ', '.join(a.title for a in D.apps), flush=True)
+    print('Molette gauche = page. S1 = stop video. GET /apps pour la liste.', flush=True)
     ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
 
 

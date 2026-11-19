@@ -13,5 +13,6 @@
     "S5": null,
     "S6": null
   },
-  "pages": {}
+  "pages": {},
+  "led_feedback": true
 }

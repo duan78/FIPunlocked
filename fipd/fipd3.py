@@ -60,10 +60,12 @@ do.DirectOutput_RegisterPageCallback.argtypes = [VOID_P, PAGE_CB, VOID_P]
 do.DirectOutput_AddPage.argtypes = [VOID_P, wt.DWORD, wt.LPCWSTR, wt.DWORD]
 do.DirectOutput_RemovePage.argtypes = [VOID_P, wt.DWORD]
 do.DirectOutput_SetImage.argtypes = [VOID_P, wt.DWORD, wt.DWORD, wt.DWORD, VOID_P]
+do.DirectOutput_SetLed.argtypes = [VOID_P, wt.DWORD, wt.DWORD, wt.DWORD]
 
 SOFTBUTTONS = {0x01: 'select', 0x02: 'right_cw', 0x04: 'right_ccw', 0x08: 'left_ccw',
                0x10: 'left_cw', 0x20: 'S1', 0x40: 'S2', 0x80: 'S3',
                0x100: 'S4', 0x200: 'S5', 0x400: 'S6'}
+LED_OF = {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5, 'S6': 6}   # LEDs 7-8 : fixes
 
 import json
 import keysend
@@ -72,6 +74,7 @@ BINDINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fipd_b
 
 DEFAULT_BINDINGS = {
     'paging': True,
+    'led_feedback': True,          # LED du bouton allumee pendant l'appui
     'bindings': {n: None for n in SOFTBUTTONS.values()},
     'pages': {},
 }
@@ -218,6 +221,8 @@ class Daemon:
         # E_PAGENOTACTIVE : seul un dessin sur la page COURANTE est accepte.
         # Les 5 pages sont enregistrees (boutons ↑/↓), puis on rend la 1re courante.
         self._activate(0)
+        self.set_led(7, False)                # LEDs fixes (7-8) eteintes par defaut :
+        self.set_led(8, False)                # pilotables librement via POST /led
         self._refresh_page(0)
         time.sleep(0.5)                       # laisser fuiter les callbacks d'init
         self._own_nav = False
@@ -367,6 +372,12 @@ class Daemon:
                 edges[n] = False
         if edges:
             self.bindings.dispatch(edges, self.mode, self.page)
+            # retour lumineux : LED du bouton pendant l'appui (local au FIP)
+            if self.bindings.cfg.get('led_feedback', True):
+                for name, pressed in edges.items():
+                    led = LED_OF.get(name)
+                    if led:
+                        self.set_led(led, pressed)
 
         # actions internes (pages du FIP) — par defaut les touches restent locales
         if self.mode == 'ui':
@@ -395,6 +406,25 @@ class Daemon:
         with self.lock:                      # callback boutons + keepalive serrialises
             self._last_raw = buf
             do.DirectOutput_SetImage(self.hdev, FW_BASE, 0, 320 * 240 * 3, buf)
+
+    def set_led(self, index, on):
+        """LED d'un bouton lateral, sur la page COURANTE (regle E_PAGENOTACTIVE).
+        Retourne le hr pour diagnostic."""
+        try:
+            return do.DirectOutput_SetLed(self.hdev, FW_BASE + self.page,
+                                          index, 1 if on else 0) & 0xFFFFFFFF
+        except OSError as e:
+            return (e.winerror or 0) & 0xFFFFFFFF
+
+    def scan_leds(self):
+        """Balaie indices 0..12 on/off (400 ms) : l'utilisateur guette une lumiere."""
+        results = {}
+        for idx in list(range(0, 13)):
+            results[f'led{idx}_on'] = self.set_led(idx, True)
+            time.sleep(0.4)
+            self.set_led(idx, False)
+            time.sleep(0.2)
+        return results
 
     def _redraw_now(self):
         """Programme un redraw immediat (thread d'affichage)."""
@@ -682,6 +712,15 @@ class H(BaseHTTPRequestHandler):
             if self.path == '/ui':
                 D.mode = 'ui'
                 return self._json({'ok': True, 'mode': D.mode})
+            if self.path == '/led':
+                dd = json.loads(body or b'{}')
+                if dd.get('scan'):
+                    return self._json({'scan': D.scan_leds()})
+                idx = int(dd.get('index', 0))
+                on = bool(dd.get('on', True))
+                hr = D.set_led(idx, on)
+                return self._json({'ok': hr == 0, 'index': idx, 'on': on,
+                                   'hr': f'{hr:08X}', 'page': D.page})
             if self.path == '/bindings':
                 try:
                     cfg = json.loads(body)

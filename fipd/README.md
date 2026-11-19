@@ -47,7 +47,9 @@ select=0x01, R_CW/CCW=0x02/0x04, L_CW/CCW=0x10/0x08 (confirmés matériel 19/11)
   `ext\Saitek.FIP.dll` (UI WPF) + device raw dans SPAD.neXt.Devices.dll (obfusqué).
   SPAD streame des images rendues côté hôte (pas de serveur embarqué).
 
-## Reste à faire (prochaine session)
+## Reste à faire
+- **Applis 100% FIP** : mini-framework de pages interactives combinant ecran,
+  boutons, molettes et LEDs (widgets, focus, alertes visuelles).
 - **Init pur (pour Linux)** : capturer les bytes wire exacts de `AddPage(0,ACTIVE)`
   côté service — proxy DLL amélioré (logger TOUS les args de Create + hooker les
   WriteFile du vrai plugin via IAT) pendant un cycle service+client. Puis :

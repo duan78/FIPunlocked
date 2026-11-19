@@ -20,6 +20,8 @@ controller** for anything: system dashboard, news reader, custom pages, or plain
 
 - 🖥️ **320×240 display** — push any PNG/JPG/BMP/WEBP, a URL, or a video file
 - 🔘 **6 side buttons + 2 knobs** — live feedback, edge detection (press/release)
+- 💡 **8 LEDs** — one per side button (lights on press, like a Stream Deck) plus
+  two extra LEDs, all individually controllable
 - 📑 **5 built-in pages** (left knob cycles) — see below
 - ⌨️ **Opt-in keyboard bindings** — map `ctrl+shift+s`, `volumemute`, `win+d`…
   on any control. *Default: controls act only on the FIP's own pages, nothing
@@ -83,6 +85,7 @@ curl -X POST -d '{"paging": true,
 | `GET /buttons` | SSE stream of button/knob events |
 | `GET /events` | Last 50 events (JSON) |
 | `GET/POST /bindings` | Read / update keyboard bindings |
+| `POST /led` `{"index":1..8,"on":true}` | Control a LED (`{"scan":true}` to cycle) |
 | `GET /keys` | Recognized key names |
 | `GET /` | Status page |
 
@@ -113,13 +116,22 @@ real plugin inside the service to log its exact init sequence. The full story
 lives in [`fipd/README.md`](fipd/README.md) (French); reference wire captures in
 `fipd/startserver_session.log` and `fipd/proxy_log_copie.txt`.
 
+## 💡 LEDs
+
+`DirectOutput_SetLed` follows the same **current-page** rule as `SetImage`.
+Valid indices: **1–6** (side buttons S1–S6) and **7–8** (two extra LEDs, on by
+default on stock firmware — the daemon turns them off so you own them). LED
+states are per firmware page. Button-press lighting can be disabled with
+`"led_feedback": false` in `fipd_bindings.json`.
+
 ## 🗺️ Roadmap
 
+- [ ] **FIP-native apps** — a small framework to build fully interactive pages
+      combining display, buttons, knobs and LEDs (widgets, focus, alerts…)
 - [ ] Capture the exact wire bytes of the page-activation sequence → pure-Python
       `firmware_init()` (drop the Logitech stack entirely)
 - [ ] **Linux port** — libusb for the bulk interface (44-byte big-endian header
       protocol, already decoded in `fip.py`) + hidraw for buttons
-- [ ] LED support (hardware-dependent: ACK'd but seemingly not wired on the A2AE)
 
 ## 📁 Layout
 

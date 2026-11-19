@@ -664,7 +664,12 @@ class Daemon:
                 for name, was_pressed in edges.items():
                     led = LED_OF.get(name)
                     if led:
-                        self.set_led(led, was_pressed)
+                        if was_pressed:
+                            self.set_led(led, True)
+                        else:
+                            # relachement : restaurer l'etat LED voulu par l'app
+                            # (une LED persistante reste allumee, les autres s'eteignent)
+                            self.set_led(led, app.leds.get(led, False))
 
         # actions internes (pages du FIP) — par defaut les touches restent locales
         if self.mode == 'ui':

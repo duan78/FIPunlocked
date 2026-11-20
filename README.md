@@ -195,9 +195,10 @@ states are per firmware page. Button-press lighting can be disabled with
 - [x] **Third-party app hot-loading** (`apps/`, `POST /apps/reload`) + shared
       design system (`charte.py`) — shipped Nov 20, 2026 with 7 apps
 - [x] **Contextual page** (active window / GitHub tab) — shipped Nov 20, 2026
-- [ ] **All open windows + all Chrome tabs** on the panel (Chrome extension
-      in `fipd/extension_fip/` — pushes tabs to the daemon, executes commands
-      back: activate/close/reload/pin)
+- [x] **All open windows + all Chrome tabs** on the panel — shipped Nov 20,
+      2026: the FENETRES page lists every window and every Chrome tab
+      (fed by the extension in `fipd/extension_fip/`), with contextual
+      actions per entry (focus, close, kill, activate/close/reload/pin tab…)
 - [ ] Capture the exact wire bytes of the page-activation sequence → pure-Python
       `firmware_init()` (drop the Logitech stack entirely)
 - [ ] **Linux port** — libusb for the bulk interface (44-byte big-endian header

@@ -625,7 +625,16 @@ class Daemon:
                                              # depuis un callback du service = reentrance)
         self._gap_timer = None    # detection de l'ecran home Saitek (a sauter)
         self._own_nav = False     # nos propres activations (ne pas detecter de trou)
+        self.chrome_tabs = []     # dernier flux de l'extension (POST /app/fenetres)
+        self.chrome_tabs_t = 0.0
+        self.tab_cmd = None       # commande en attente pour l'extension
+        self.tab_gen = 0
         self.apps = self._builtin_apps() + self._discover_apps()
+
+    def queue_tab_cmd(self, cmd):
+        """Commande a executer par l'extension Chrome (protocole cursor)."""
+        self.tab_cmd = cmd
+        self.tab_gen += 1
 
     def _npages(self):
         return len(self.apps)
@@ -1235,7 +1244,7 @@ class H(BaseHTTPRequestHandler):
             if self.path == '/apps/reload':
                 return self._json(D.reload_apps())
             if self.path.startswith('/app/'):
-                name = self.path[len('/app/'):].strip('/')
+                name = self.path[len('/app/'):].split('?')[0].strip('/')
                 app = next((a for a in D.apps if a.name == name), None)
                 if app is None:
                     return self._json({'error': f'app inconnue: {name}'}, 404)
@@ -1243,7 +1252,15 @@ class H(BaseHTTPRequestHandler):
                 if h is None:
                     return self._json({'error': f'{name} n expose pas http_post'}, 405)
                 try:
-                    return self._json(h(json.loads(body or b'{}')))
+                    payload = json.loads(body or b'{}')
+                    out = h(payload)
+                    # etat partage : les onglets Chrome interessent plusieurs
+                    # apps (fenetres, contexte)
+                    if name == 'fenetres' and isinstance(payload.get('tabs'),
+                                                         list):
+                        D.chrome_tabs = payload['tabs']
+                        D.chrome_tabs_t = time.time()
+                    return self._json(out)
                 except Exception as e:
                     return self._json({'error': str(e)}, 500)
             if self.path == '/bindings':

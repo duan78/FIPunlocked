@@ -97,8 +97,6 @@ class FenetresApp(App):
         self.tabs_t = 0.0
         self.cursor = 0              # entree selectionnee (0..n-1)
         self._armed = None           # ('close'|'kill'|'others', t0)
-        self._cmd = None             # commande en attente pour l'extension
-        self._gen = 0                # generation de commande (protocole cursor)
         self._stop = threading.Event()
         threading.Thread(target=self._watch, daemon=True).start()
 
@@ -158,11 +156,10 @@ class FenetresApp(App):
         self.cursor = max(0, min(self.cursor, len(ent) - 1))
         return ent[self.cursor]
 
-    # ---------- commandes extension ----------
+    # ---------- commandes extension (file du daemon, partagee) ----------
 
     def _queue(self, cmd):
-        self._cmd = cmd
-        self._gen += 1
+        self.d.queue_tab_cmd(cmd)
 
     def http_post(self, payload):
         tabs = payload.get('tabs')
@@ -184,8 +181,9 @@ class FenetresApp(App):
                 ext = int(q['cursor'][0])
             except Exception:
                 ext = -1
-        cmd = self._cmd if (self._cmd and ext < self._gen) else None
-        return {'cmd': cmd, 'cursor': self._gen,
+        gen = getattr(self.d, 'tab_gen', 0)
+        cmd = self.d.tab_cmd if (self.d.tab_cmd and ext < gen) else None
+        return {'cmd': cmd, 'cursor': gen,
                 'windows': len(self.wins), 'tabs': len(self.tabs)}
 
     # ---------- boutons ----------

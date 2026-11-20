@@ -64,6 +64,17 @@ molette droite), DEMO FIPUI (liste défilante viewport-relative) et REFLEX
 à chaud ; une classe `fipui.App` avec `name` != 'app' et pas `abstract` ;
 option `render_full(img)` pour coller des images ; option `http_get/http_post`
 pour exposer `/app/<name>`) :
+- - **FENETRES** — toutes les **fenêtres ouvertes** (EnumWindows : z-order,
+  processus, états premier plan/minimisée/toujours devant) + tous les
+  **onglets Chrome** (via l'extension `extension_fip/`). Layout 30/70 :
+  keycaps contextuels de l'entrée sélectionnée (molette droite = curseur) —
+  fenêtre : Focus/Minimiser/Devant/Fermer 2×/Tuer 2×/Copier titre ; onglet :
+  Activer (+focus fenêtre)/Fermer/Recharger/Épingler/Fermer les autres 2×/
+  Copier URL. **Installation extension (1×)** : Chrome → `chrome://extensions`
+  → Mode développeur → « Charger l'extension non empaquetée » → sélectionner
+  `fipd/extension_fip/`. Contrat : `POST /app/fenetres {tabs:[…]}` +
+  `GET /app/fenetres?cursor=N` → `{cmd, cursor}` (activation/fermeture/
+  rechargement/épinglage pilotés depuis le FIP).
 - **CONTEXTE** — page caméléon : s'adapte à la **fenêtre active** (processus +
   titre ; le titre d'un navigateur = onglet actif). **Layout 2 colonnes
   30/70 : gauche = 6 keycaps pleine hauteur alignées sur les boutons

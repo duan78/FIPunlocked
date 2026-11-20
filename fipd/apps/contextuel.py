@@ -24,6 +24,7 @@ import subprocess
 import threading
 import time
 from ctypes import wintypes as wt
+from urllib.parse import urlsplit
 
 import charte
 import fipui
@@ -148,6 +149,11 @@ class ContextuelApp(App):
         self.pending = None            # candidate en cours de validation
         self.invalid = set()           # candidats rejetes par gh
         self.cache = {}                # repo -> {'t', 'data', 'prs', 'runs'}
+        self.tab = None                # onglet actif (extension Chrome)
+        self.kind = 'app'              # github | youtube | site | app
+        self.pl = None                 # payload du contexte (repo/url)
+        self.yt = {}                   # url youtube -> {'data', 'img'}
+        self.fav = {}                  # host -> favicon PIL (ou None)
         self.scroll = 0
         self.exe = ''                 # chemin de l'exe au premier plan
         self.topmost = False
@@ -180,10 +186,18 @@ class ContextuelApp(App):
                     self.exe = psutil.Process(pid).exe()
                 except Exception:
                     self.exe = ''
-            repo = self._extract_repo(title)
+            kind, pl, self.tab = self._classify(title)
+            self.kind, self.pl = kind, pl
+            repo = pl if kind == 'github' else None
             if repo and repo in self.invalid:
                 repo = None
-            changed = (repo, proc, title[:60]) != last
+            if kind == 'youtube' and pl and pl not in self.yt:
+                self._yt_fetch(pl)
+            if kind == 'site' and pl:
+                host = urlsplit(pl).netloc
+                if host and host not in self.fav:
+                    self._fav_fetch(host)
+            changed = (repo, kind, pl, proc, title[:60]) != last
             if repo != self.repo:
                 self.repo = repo
                 self.scroll = 0
@@ -191,7 +205,7 @@ class ContextuelApp(App):
                     self.pending = repo
                 changed = True
             if changed:
-                last = (repo, proc, title[:60])
+                last = (repo, kind, pl, proc, title[:60])
                 self.d._redraw_now()
             self._stop.wait(POLL_S)
 
@@ -204,6 +218,93 @@ class ContextuelApp(App):
                 if len(o) >= 2 and len(r) >= 2:
                     return f'{o}/{r}'
         return None
+
+    # ---------- classification du contexte (fenetre/onglet actif) ----------
+
+    def _fg_tab(self):
+        """Onglet ACTIF de la fenetre navigateur au premier plan (extension),
+        ou None. La fenetre Chrome a pour titre '<onglet actif> - Navigateur'."""
+        if self.proc not in ('chrome.exe', 'msedge.exe'):
+            return None
+        tabs = getattr(self.d, 'chrome_tabs', None) or []
+        if time.time() - getattr(self.d, 'chrome_tabs_t', 0) > 12:
+            return None
+        act = [t for t in tabs if t.get('active')]
+        if not act:
+            return None
+        wt = (self.wtitle or '').lower()
+        for t in sorted(act, key=lambda t: len(t.get('title') or ''),
+                        reverse=True):
+            tt = (t.get('title') or '')[:30].lower()
+            if tt and wt.startswith(tt[:18]):
+                return t
+        return act[0] if len(act) == 1 else None
+
+    def _classify(self, title):
+        """-> (kind, payload, tab) : github+repo | youtube+url | site+url |
+        app+None. L'URL de l'onglet (extension) prime sur le titre."""
+        tab = self._fg_tab()
+        if tab is not None:
+            url = tab.get('url') or ''
+            host = urlsplit(url).netloc.lower()
+            path = urlsplit(url).path
+            if 'github.com' in host:
+                m = re.match(r'^/([\w.-]+)/([\w.-]+)', path)
+                if m and len(m.group(2)) >= 2 and m.group(1) not in (
+                        'orgs', 'users', 'settings', 'marketplace',
+                        'topics', 'features', 'explore', 'notifications',
+                        'pulls', 'search', 'new', 'codespaces'):
+                    return 'github', f'{m.group(1)}/{m.group(2)}', tab
+            yt = (('youtube.com' in host and
+                   (path == '/watch' or host.startswith('music.')))
+                  or 'youtu.be' in host)
+            if yt and url:
+                return 'youtube', url, tab
+            if url.startswith('http'):
+                return 'site', url, tab
+            return 'app', None, tab
+        repo = self._extract_repo(title)      # sans extension : par titre
+        if repo:
+            return 'github', repo, None
+        return 'app', None, None
+
+    def _yt_fetch(self, url):
+        """Metadonnees + miniature YouTube via oEmbed (sans cle)."""
+        import io as _io
+        entry = {'data': None, 'img': None}
+        self.yt[url] = entry
+        try:
+            import requests
+            r = requests.get('https://www.youtube.com/oembed',
+                             params={'url': url, 'format': 'json'},
+                             timeout=6)
+            if r.status_code == 200:
+                entry['data'] = r.json()
+                ir = requests.get(entry['data'].get('thumbnail_url'),
+                                  timeout=6)
+                if ir.status_code == 200:
+                    from PIL import Image
+                    entry['img'] = Image.open(_io.BytesIO(ir.content)) \
+                        .convert('RGB')
+        except Exception:
+            pass
+        self.d._redraw_now()
+
+    def _fav_fetch(self, host):
+        """Favicon via le service Google S2 (cache par host)."""
+        import io as _io
+        self.fav[host] = None
+        try:
+            import requests
+            r = requests.get('https://www.google.com/s2/favicons',
+                             params={'domain': host, 'sz': 64}, timeout=6)
+            if r.status_code == 200 and r.content[:4] != b'None':
+                from PIL import Image
+                img = Image.open(_io.BytesIO(r.content)).convert('RGBA')
+                self.fav[host] = img
+        except Exception:
+            pass
+        self.d._redraw_now()
 
     # ---------- recuperation des donnees GitHub (thread fetcher) ----------
 
@@ -262,7 +363,52 @@ class ContextuelApp(App):
         if name not in ('S1', 'S2', 'S3', 'S4', 'S5', 'S6'):
             return
         n = int(name[1])
-        if self.repo:
+        tab = self.tab or {}
+        tid = tab.get('id')
+        if self.kind == 'youtube' and self.pl:
+            e = self.yt.get(self.pl) or {}
+            data = e.get('data') or {}
+            title = (data.get('title')
+                     or tab.get('title', '').replace(' - YouTube', ''))
+            if n == 1:
+                import keysend
+                keysend.tap('playpause')
+            elif n == 2:
+                clipboard_set(self.pl)
+                self.alert('URL copiee')
+            elif n == 3:
+                clipboard_set(title)
+                self.alert('titre copie')
+            elif n == 4:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (title or '').replace(' ', '+'))
+            elif n == 5 and tid is not None:
+                self.d.queue_tab_cmd({'action': 'close', 'tabId': tid})
+                self.alert('fermeture')
+            elif n == 6 and tid is not None:
+                self.d.queue_tab_cmd({'action': 'reload', 'tabId': tid})
+                self.alert('rechargement')
+        elif self.kind == 'site' and self.pl:
+            if n == 1:
+                clipboard_set(self.pl)
+                self.alert('URL copiee')
+            elif n == 2:
+                clipboard_set(tab.get('title') or '')
+                self.alert('titre copie')
+            elif n == 3:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (tab.get('title') or self.pl)
+                                .replace(' ', '+'))
+            elif n == 4 and tid is not None:
+                self.d.queue_tab_cmd({'action': 'pin', 'tabId': tid})
+                self.alert('epingle ?')
+            elif n == 5 and tid is not None:
+                self.d.queue_tab_cmd({'action': 'close', 'tabId': tid})
+                self.alert('fermeture')
+            elif n == 6 and tid is not None:
+                self.d.queue_tab_cmd({'action': 'reload', 'tabId': tid})
+                self.alert('rechargement')
+        elif self.repo:
             base = f'https://github.com/{self.repo}'
             if n == 1:
                 webbrowser.open(base + '/issues')
@@ -381,8 +527,12 @@ class ContextuelApp(App):
         from PIL import ImageDraw
         d = ImageDraw.Draw(img)
         d.rectangle((0, 0, 319, 239), fill=charte.BG)
-        if self.repo:
+        if self.kind == 'github' and self.repo:
             self._rg_github(img, d)
+        elif self.kind == 'youtube':
+            self._rg_youtube(img, d)
+        elif self.kind == 'site':
+            self._rg_site(img, d)
         else:
             self._rg_default(img, d)
 
@@ -509,6 +659,98 @@ class ContextuelApp(App):
             d.text((106, dy), ln, font=F_T, fill=(110, 118, 129),
                    anchor='lm')
             dy += 12
+
+    def _rg_youtube(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        e = self.yt.get(self.pl) or {}
+        data = e.get('data') or {}
+        title = (data.get('title')
+                 or (self.tab or {}).get('title', '').replace(' - YouTube', '')
+                 or '(video)')
+        caps = [
+            (charte.ico_play, 'Lecture', '', None, False),
+            (charte.ico_link, 'URL', '', None, False),
+            (charte.ico_copy, 'Titre', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_x, 'Fermer', '', None, False),
+            (charte.ico_clock, 'Refresh', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'YT', charte.RED)
+        thumb = e.get('img')
+        if thumb is not None:
+            w, h = 196, 110
+            r = max(w / thumb.width, h / thumb.height)
+            t2 = thumb.resize((int(thumb.width * r) + 1,
+                               int(thumb.height * r) + 1))
+            x = (t2.width - w) // 2
+            y = (t2.height - h) // 2
+            crop = charte.rounded(t2.crop((x, y, x + w, y + h)), 8)
+            img.paste(crop, (110, 12), crop)
+        else:
+            d.rounded_rectangle((110, 12, 306, 122), radius=8,
+                                fill=charte.CARD, outline=charte.BORDER)
+            d.text((208, 67), 'miniature...', font=F_XS, fill=charte.DIM,
+                   anchor='mm')
+        import textwrap
+        lines = textwrap.wrap(title, 40)[:2] or [' ']
+        yy = 138
+        for ln in lines:
+            d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
+            yy += 17
+        if data.get('author_name'):
+            d.text((106, yy + 4), data['author_name'], font=F_T,
+                   fill=charte.DIM, anchor='lm')
+
+    def _rg_site(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        tab = self.tab or {}
+        host = urlsplit(self.pl or '').netloc
+        caps = [
+            (charte.ico_link, 'URL', '', None, False),
+            (charte.ico_copy, 'Titre', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_pin, 'Epingler', 'ON' if tab.get('pinned') else '',
+             charte.BLUE if tab.get('pinned') else None,
+             bool(tab.get('pinned'))),
+            (charte.ico_x, 'Fermer', '', None, False),
+            (charte.ico_clock, 'Refresh', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'WEB', charte.TEAL)
+        fav = self.fav.get(host)
+        if fav is not None:
+            f2 = fav.resize((36, 36))
+            img.paste(f2, (106, 12), f2)
+        else:
+            av = charte.letter_avatar(host, 36, 8)
+            img.paste(av, (106, 12), charte.rounded(av, 8))
+        h2 = host.replace('www.', '')[:24]
+        d.text((152, 30), h2, font=F_S, fill=charte.FG, anchor='lm')
+        import textwrap
+        lines = textwrap.wrap(tab.get('title') or host, 32)[:3] or [' ']
+        yy = 68
+        d.text((106, yy), 'TITRE', font=F_T, fill=charte.DIM, anchor='lm')
+        yy += 16
+        for ln in lines:
+            d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
+            yy += 17
+        d.text((106, yy + 6), 'URL', font=F_T, fill=charte.DIM, anchor='lm')
+        yy += 22
+        for ln in textwrap.wrap(self.pl or '', 44)[:2]:
+            d.text((106, yy), ln, font=F_T, fill=(110, 118, 129),
+                   anchor='lm')
+            yy += 13
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

@@ -201,6 +201,13 @@ def ico_code(d, cx, cy, r, col):
     d.line((cx + 2, cy, cx + r - 2, cy + r - 1), fill=col, width=2)
 
 
+def ico_mail(d, cx, cy, r, col):
+    d.rounded_rectangle((cx - r, cy - r + 2, cx + r, cy + r), radius=2,
+                        outline=col, width=2)
+    d.line((cx - r, cy - r + 3, cx, cy + 1), fill=col, width=2)
+    d.line((cx, cy + 1, cx + r, cy - r + 3), fill=col, width=2)
+
+
 # ---------- avatars ----------
 
 def _hash_color(name):

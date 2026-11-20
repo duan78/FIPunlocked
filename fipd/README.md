@@ -78,7 +78,12 @@ pour exposer `/app/<name>`) :
   panneau d'infos). Contextes : **onglet GitHub** → fiche repo (avatar,
   stats, runs, PR, description ; S1-S6 = Issues/PRs/Actions/Repo/URL/Clone)
   ; **onglet YouTube** → miniature + titre + chaîne (oEmbed, Lecture/Pause,
-  copies, Google, volume) ; **onglet web** → favicon + domaine + titre +
+  copies, Google, volume) ; **onglet Gmail** → badge messages non lus (titre), adresse,
+  nouveau message (compose) ; **page GitHub PR/Issue** → `gh pr/issue view` :
+  état, auteur, +additions/-deletions, reviews, commentaires, titre ;
+  **modèle HuggingFace** → API publique : likes, downloads, pipeline,
+  librairie, `huggingface-cli download` copié en 1 bouton ; **onglet web**
+  → favicon + domaine + titre +
   URL (copies, Google, domaine, volume) ; **app Windows** → fiches par
   application : **Explorateur** (chemin réel via COM Shell.Application,
   nb d'éléments, espace libre ; copier chemin / chemin unix / terminal ici

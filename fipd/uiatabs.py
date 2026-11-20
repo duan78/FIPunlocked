@@ -45,6 +45,35 @@ def _strip_suffix(title):
     return title
 
 
+def _find_strip(root, base, budget=0.5):
+    """DFS limite : premier TabControl dont un enfant porte le nom de
+    l'onglet actif (= bandeau navigateur). None si introuvable."""
+    import uiautomation as auto
+    t0 = time.time()
+
+    def rec(ctrl, depth):
+        if depth > 12 or time.time() - t0 > budget:
+            return None
+        try:
+            kids = ctrl.GetChildren()
+        except Exception:
+            return None
+        for ch in kids:
+            if isinstance(ch, auto.TabControl):
+                names = []
+                for t in ch.GetChildren():
+                    if isinstance(t, auto.TabItemControl):
+                        names.append((t.Name or '').strip())
+                if base in names:
+                    return ch
+            r = rec(ch, depth + 1)
+            if r is not None:
+                return r
+        return None
+
+    return rec(root, 0)
+
+
 def _scan():
     """Un passage UIA (thread dedie, COM initialise)."""
     import comtypes
@@ -100,8 +129,12 @@ def _scan():
                 last = _last_url.get(h)
                 if last and time.time() - last[1] < URL_STICKY_S:
                     entry['url'] = last[0]    # lecture ratee : derniere connue
-            # onglets : enfants du TabControl du bandeau (hors contenu web)
-            tabs_ctrl = c.TabControl(searchDepth=30)
+            # onglets : le VRAI bandeau est le TabControl qui contient un
+            # onglet nomme comme le titre de la fenetre (les pages web ont
+            # aussi leurs propres TabControl internes !)
+            tabs_ctrl = _find_strip(c, _strip_suffix(title))
+            if tabs_ctrl is None:
+                tabs_ctrl = c.TabControl(searchDepth=30)   # repli
             if tabs_ctrl is not None:
                 base = _strip_suffix(title)
                 for tab in tabs_ctrl.GetChildren():
@@ -148,7 +181,11 @@ def select(hwnd, tab_title):
         ok = False
         c = auto.ControlFromHandle(hwnd)
         if c is not None:
-            tabs_ctrl = c.TabControl(searchDepth=30)
+            buf = ctypes.create_unicode_buffer(512)
+            u32.GetWindowTextW(hwnd, buf, 512)
+            tabs_ctrl = _find_strip(c, _strip_suffix(buf.value.strip()))
+            if tabs_ctrl is None:
+                tabs_ctrl = c.TabControl(searchDepth=30)
             if tabs_ctrl is not None:
                 for tab in tabs_ctrl.GetChildren():
                     if (tab.Name or '').strip() == tab_title:

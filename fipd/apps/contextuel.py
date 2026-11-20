@@ -155,7 +155,11 @@ class ContextuelApp(App):
         self.tab_since = 0.0           # debut du contexte courant (duree)
         self.yt = {}                   # url youtube -> {'data', 'img'}
         self.fav = {}                  # host -> favicon PIL (ou None)
-        self._exp = {'t': 0.0, 'map': {}}   # hwnd -> (chemin, obj COM)
+        self.ghd = {}                  # (repo, kind, n) -> {'t', 'data'}
+        self.hfd = {}                  # modele HF -> {'t', 'data'}
+        self._busy2 = threading.Lock()     # serialise les fetchs detailles
+        self.exp_sel = []              # fichiers selectionnes (explorer)
+        self._exp = {'t': 0.0, 'map': {}}   # hwnd -> (chemin, obj, sel)
         self._com_init = False
         self.scroll = 0
         self.exe = ''                 # chemin de l'exe au premier plan
@@ -200,6 +204,21 @@ class ContextuelApp(App):
                 host = urlsplit(pl).netloc
                 if host and host not in self.fav:
                     self._fav_fetch(host)
+            if kind == 'ghpage' and isinstance(pl, dict):
+                key = (pl['repo'], pl['kind'], pl['n'])
+                c = self.ghd.get(key)
+                if (not c or time.time() - c['t'] > TTL_S) and \
+                        self._busy2.acquire(blocking=False):
+                    threading.Thread(target=self._fetch_ghpage,
+                                     args=(dict(pl),), daemon=True).start()
+            if kind == 'hf' and pl:
+                c = self.hfd.get(pl)
+                if (not c or time.time() - c['t'] > 60) and \
+                        self._busy2.acquire(blocking=False):
+                    threading.Thread(target=self._fetch_hf, args=(pl,),
+                                     daemon=True).start()
+            if kind == 'explorer':
+                self.exp_sel = self._explorer_sel()
             changed = (repo, kind, pl, proc, title[:60]) != last
             if pl != getattr(self, '_last_pl', None):
                 self._last_pl = pl
@@ -249,7 +268,24 @@ class ContextuelApp(App):
             url = tab.get('url') or ''
             host = urlsplit(url).netloc.lower()
             path = urlsplit(url).path
+            if host == 'mail.google.com':
+                return 'gmail', url, tab
+            if host.endswith('huggingface.co'):
+                m = re.match(r'^/([\w.-]+)/([\w.-]+)/?$', path)
+                if m and m.group(1) not in (
+                        'settings', 'spaces', 'datasets', 'models', 'docs',
+                        'blog', 'join', 'login', 'logout', 'signup',
+                        'tasks', 'trending', 'papers', 'organizations',
+                        'jobs', 'checkout', 'docs'):
+                    return 'hf', f'{m.group(1)}/{m.group(2)}', tab
             if 'github.com' in host:
+                md = re.match(r'^/([\w.-]+)/([\w.-]+)/(pull|issues)/(\d+)',
+                              path)
+                if md and md.group(1) not in ('orgs', 'users', 'marketplace'):
+                    return 'ghpage', {'repo': f'{md.group(1)}/{md.group(2)}',
+                                      'kind': ('pull' if md.group(3) == 'pull'
+                                               else 'issue'),
+                                      'n': int(md.group(4))}, tab
                 m = re.match(r'^/([\w.-]+)/([\w.-]+)', path)
                 if m and len(m.group(2)) >= 2 and m.group(1) not in (
                         'orgs', 'users', 'settings', 'marketplace',
@@ -311,11 +347,18 @@ class ContextuelApp(App):
                         path = unquote(loc[8:]).replace('/', os.sep)
                     if not path:
                         path = w.Document.Folder.Self.Path
+                    sel = []
+                    try:                      # fichiers selectionnes
+                        s = w.Document.SelectedItems()
+                        for i in range(min(s.Count(), 8)):
+                            sel.append(s.Item(i).Path)
+                    except Exception:
+                        pass
                     if path and not path.startswith('::'):
-                        out[hwnd] = (path, w)
+                        out[hwnd] = (path, w, sel)
                     else:
                         name = w.Document.Folder.Self.Name or 'Dossier'
-                        out[hwnd] = (name, w)
+                        out[hwnd] = (name, w, sel)
                 except Exception:
                     continue
         except Exception as e:
@@ -326,15 +369,24 @@ class ContextuelApp(App):
     def _explorer_lookup(self):
         """Chemin de la fenetre explorer au premier plan, ou None."""
         try:
-            return self._explorer_map().get(self.hwnd, (None, None))[0]
+            return self._explorer_map().get(self.hwnd,
+                                            (None, None, []))[0]
         except Exception:
             return None
 
     def _explorer_obj(self):
         try:
-            return self._explorer_map().get(self.hwnd, (None, None))[1]
+            return self._explorer_map().get(self.hwnd,
+                                            (None, None, []))[1]
         except Exception:
             return None
+
+    def _explorer_sel(self):
+        """Chemins des elements selectionnes dans la fenetre au premier plan."""
+        try:
+            return self._explorer_map().get(self.hwnd, (None, None, []))[2]
+        except Exception:
+            return []
 
     @staticmethod
     def _unix_path(p):
@@ -383,6 +435,41 @@ class ContextuelApp(App):
         except Exception:
             pass
         self.d._redraw_now()
+
+    def _fetch_ghpage(self, pl):
+        """PR ou issue GitHub : gh pr/issue view (cache TTL 45 s)."""
+        key = (pl['repo'], pl['kind'], pl['n'])
+        try:
+            if pl['kind'] == 'pull':
+                data = gh(['pr', 'view', str(pl['n']), '-R', pl['repo'],
+                           '--json', 'title,author,state,additions,deletions,'
+                           'comments,reviews,createdAt,url'])
+            else:
+                data = gh(['issue', 'view', str(pl['n']), '-R', pl['repo'],
+                           '--json',
+                           'title,author,state,comments,createdAt,url,labels'])
+            self.ghd[key] = {'t': time.time(), 'data': data}
+        except Exception as e:
+            self.ghd[key] = {'t': time.time(), 'data': None,
+                             'err': str(e).split('\n')[0][:70]}
+        finally:
+            self._busy2.release()
+            self.d._redraw_now()
+
+    def _fetch_hf(self, model):
+        """Modele HuggingFace : API publique (cache TTL 60 s)."""
+        try:
+            import requests
+            r = requests.get(f'https://huggingface.co/api/models/{model}',
+                             timeout=8)
+            r.raise_for_status()
+            self.hfd[model] = {'t': time.time(), 'data': r.json()}
+        except Exception as e:
+            self.hfd[model] = {'t': time.time(), 'data': None,
+                               'err': str(e)[:70]}
+        finally:
+            self._busy2.release()
+            self.d._redraw_now()
 
     # ---------- recuperation des donnees GitHub (thread fetcher) ----------
 
@@ -442,7 +529,75 @@ class ContextuelApp(App):
             return
         n = int(name[1])
         tab = self.tab or {}
-        if self.kind == 'youtube' and self.pl:
+        if self.kind == 'gmail':
+            import keysend
+            m2 = re.search(r'-\s*([\w.+-]+@[\w.-]+)', tab.get('title') or '')
+            if n == 1:                        # nouveau message
+                os.startfile('https://mail.google.com/mail/u/0/#inbox'
+                             '?compose=new')
+                self.alert('nouveau message')
+            elif n == 2 and m2:
+                clipboard_set(m2.group(1))
+                self.alert('adresse copiee')
+            elif n == 3:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (tab.get('title') or 'gmail')
+                                .replace(' ', '+'))
+            elif n == 4:
+                clipboard_set(self.pl or '')
+                self.alert('URL copiee')
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'ghpage' and isinstance(self.pl, dict):
+            import keysend
+            pl = self.pl
+            key = (pl['repo'], pl['kind'], pl['n'])
+            data = (self.ghd.get(key) or {}).get('data') or {}
+            base = 'https://github.com/{}/{}/{}'.format(
+                pl['repo'], 'pull' if pl['kind'] == 'pull' else 'issues',
+                pl['n'])
+            if n == 1:
+                clipboard_set(base)
+                self.alert('lien copie')
+            elif n == 2:
+                clipboard_set(data.get('title', ''))
+                self.alert('titre copie')
+            elif n == 3:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (data.get('title') or
+                                 '{} #{}'.format(pl['repo'], pl['n']))
+                                .replace(' ', '+'))
+            elif n == 4:
+                clipboard_set(base + ('/files' if pl['kind'] == 'pull'
+                                      else ''))
+                self.alert('lien ' + ('fichiers' if pl['kind'] == 'pull'
+                                      else 'discussion'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'hf' and self.pl:
+            import keysend
+            model = self.pl
+            if n == 1:
+                clipboard_set(model)
+                self.alert('ID copie')
+            elif n == 2:
+                clipboard_set('https://huggingface.co/' + model)
+                self.alert('page copiee')
+            elif n == 3:
+                clipboard_set('huggingface-cli download ' + model)
+                self.alert('commande copiee')
+            elif n == 4:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                model.replace('/', ' ').replace(' ', '+'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'youtube' and self.pl:
             import keysend
             e = self.yt.get(self.pl) or {}
             data = e.get('data') or {}
@@ -484,8 +639,10 @@ class ContextuelApp(App):
                 keysend.tap('volumeup')
         elif self.kind == 'explorer' and self.pl:
             path = self.pl
-            if n == 1:
-                clipboard_set(path)
+            sel = self.exp_sel or []
+            fpath = sel[0] if (sel and os.path.isfile(sel[0])) else path
+            if n == 1:                        # chemin (fichier si selection)
+                clipboard_set(fpath)
                 self.alert('chemin copie')
             elif n == 2:                       # terminal dans ce dossier
                 try:
@@ -495,7 +652,7 @@ class ContextuelApp(App):
                                       'cd', '/d', path])
                 self.alert('terminal ouvert')
             elif n == 3:
-                clipboard_set(self._unix_path(path))
+                clipboard_set(self._unix_path(fpath))
                 self.alert('chemin unix copie')
             elif n == 4:                       # remonter au dossier parent
                 parent = os.path.dirname(path.rstrip('\\/'))
@@ -514,8 +671,19 @@ class ContextuelApp(App):
                 else:
                     self.alert('deja a la racine')
             elif n == 5:
-                clipboard_set(os.path.basename(path.rstrip('\\/')) or path)
-                self.alert('nom copie')
+                if sel:                        # ouvrir la selection dans code
+                    target = sel[0] if len(sel) == 1 else path
+                    try:
+                        subprocess.Popen(['code', target])
+                        self.alert('VS Code')
+                    except FileNotFoundError:
+                        self.alert('code absent du PATH')
+                else:
+                    try:
+                        subprocess.Popen(['code', path])
+                        self.alert('VS Code (dossier)')
+                    except FileNotFoundError:
+                        self.alert('code absent du PATH')
             elif n == 6:                       # actualiser la fenetre
                 w = self._explorer_obj()
                 if w is not None:
@@ -672,7 +840,7 @@ class ContextuelApp(App):
     def http_get(self):
         c = self.cache.get(self.repo) if self.repo else None
         return {'process': self.proc, 'title': self.wtitle[:100],
-                'kind': self.kind, 'payload': (self.pl or '')[:120],
+                'kind': self.kind, 'payload': repr(self.pl)[:120],
                 'repo': self.repo, 'pending': self.pending,
                 'stars': c['data'].get('stargazers_count') if c else None,
                 'issues': c['data'].get('open_issues_count') if c else None,
@@ -740,6 +908,12 @@ class ContextuelApp(App):
             self._rg_terminal(img, d)
         elif self.kind == 'vlc':
             self._rg_vlc(img, d)
+        elif self.kind == 'gmail':
+            self._rg_gmail(img, d)
+        elif self.kind == 'ghpage':
+            self._rg_ghpage(img, d)
+        elif self.kind == 'hf':
+            self._rg_hf(img, d)
         else:
             self._rg_default(img, d)
 
@@ -988,14 +1162,17 @@ class ContextuelApp(App):
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         path = self.pl or '?'
+        sel = self.exp_sel or []
+        sel1 = 'fichier' if (sel and os.path.isfile(sel[0])) else \
+            (str(len(sel)) if sel else '')
         is_dir = os.path.isdir(path)
         name = os.path.basename(path.rstrip('\\/')) or path
         caps = [
-            (charte.ico_copy, 'Chemin', '', None, False),
+            (charte.ico_copy, 'Chemin', sel1 if sel else '', None, False),
             (charte.ico_terminal, 'Terminal', '', None, False),
             (charte.ico_copy, 'Unix', '', None, False),
             (charte.ico_folder, 'Parent', '', None, False),
-            (charte.ico_copy, 'Nom', '', None, False),
+            (charte.ico_code, 'VS Code', '', None, bool(sel)),
             (charte.ico_clock, 'MAJ', '', None, False),
         ]
         for i, (ic, lab, val, col, hot) in enumerate(caps):
@@ -1021,26 +1198,41 @@ class ContextuelApp(App):
                    anchor='lm')
             yy += 17
         d.line((106, yy - 4, 313, yy - 4), fill=charte.BORDER)
-        # stats : nb elements + espace libre du disque
-        n_items = -1
-        if is_dir:
+        if sel:
+            # zone selection : fichiers selectionnes dans la fenetre
+            d.text((106, yy + 8), 'SELECTION ({})'.format(len(sel)),
+                   font=F_T, fill=charte.ORANGE, anchor='lm')
+            import textwrap
+            s0 = os.path.basename(sel[0])
+            for ln in textwrap.wrap(s0, 34)[:2]:
+                d.text((106, yy + 26), ln, font=F_XS, fill=charte.FG,
+                       anchor='lm')
+                yy += 17
+            if len(sel) > 1:
+                d.text((106, yy + 26), '+ {} autres'.format(len(sel) - 1),
+                       font=F_T, fill=charte.DIM, anchor='lm')
+        else:
+            # stats : nb elements + espace libre du disque
+            n_items = -1
+            if is_dir:
+                try:
+                    n_items = sum(1 for _ in os.scandir(path))
+                except OSError:
+                    n_items = -1
+            free = ''
             try:
-                n_items = sum(1 for _ in os.scandir(path)) 
-            except OSError:
-                n_items = -1
-        free = ''
-        try:
-            import shutil
-            du = shutil.disk_usage(path)
-            free = '{:.0f} Go libres'.format(du.free / 2**30)
-        except Exception:
-            pass
-        x = 106
-        if n_items >= 0:
-            x += charte.pill(d, x, yy + 14, charte.ico_window,
-                             str(n_items), charte.BLUE) + 8
-        if free:
-            charte.pill(d, x, yy + 14, charte.ico_check, free, charte.GREEN)
+                import shutil
+                du = shutil.disk_usage(path)
+                free = '{:.0f} Go libres'.format(du.free / 2**30)
+            except Exception:
+                pass
+            x = 106
+            if n_items >= 0:
+                x += charte.pill(d, x, yy + 14, charte.ico_window,
+                                 str(n_items), charte.BLUE) + 8
+            if free:
+                charte.pill(d, x, yy + 14, charte.ico_check, free,
+                            charte.GREEN)
 
     def _rg_code(self, img, d):
         F_S = fipui.font(15)
@@ -1153,6 +1345,204 @@ class ContextuelApp(App):
             d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
             yy += 17
         d.text((106, yy + 10), 'raccourcis envoyes a la fenetre VLC',
+               font=F_T, fill=(90, 95, 110), anchor='lm')
+
+    def _rg_gmail(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        tab = self.tab or {}
+        m = re.search(r'\(([\d\s\u202f.]+)\)', tab.get('title') or '')
+        unread = 0
+        if m:
+            try:
+                unread = int(m.group(1).replace(' ', '')
+                             .replace('\u202f', '').replace('.', ''))
+            except ValueError:
+                unread = 0
+        mail_addr = ''
+        m2 = re.search(r'-\s*([\w.+-]+@[\w.-]+)', tab.get('title') or '')
+        if m2:
+            mail_addr = m2.group(1)
+        caps = [
+            (charte.ico_mail, 'Nouveau', '', None, False),
+            (charte.ico_copy, 'Adresse', '' if mail_addr else 'n/a',
+             None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_link, 'Copier URL', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'MAIL', charte.RED)
+        d.rounded_rectangle((106, 12, 146, 52), radius=8, fill=(46, 16, 18),
+                            outline=charte.RED)
+        charte.ico_mail(d, 126, 32, 12, charte.RED)
+        d.text((152, 24), 'Gmail', font=F_S, fill=charte.FG, anchor='lm')
+        d.text((152, 45), (mail_addr or 'boite mail')[:28], font=F_T,
+               fill=charte.DIM, anchor='lm')
+        # badge messages non lus (titre de l'onglet)
+        y = 78
+        if unread:
+            d.rounded_rectangle((106, y, 313, y + 46), radius=10,
+                                fill=(52, 18, 20), outline=charte.RED)
+            d.text((126, y + 23), str(unread), font=fipui.font(26),
+                   fill=(255, 120, 110), anchor='lm')
+            d.text((126 + 74, y + 23), 'messages non lus', font=F_XS,
+                   fill=charte.FG, anchor='lm')
+        else:
+            d.rounded_rectangle((106, y, 313, y + 46), radius=10,
+                                fill=(16, 40, 24), outline=charte.GREEN)
+            d.text((210, y + 23), 'boite a jour', font=F_XS,
+                   fill=charte.GREEN, anchor='mm')
+        charte.ico_clock(d, 111, y + 68, 4, charte.DIM)
+        pos, tot = self._tab_pos()
+        meta = self._duree()
+        if pos:
+            meta += '   onglet {}/{}'.format(pos, tot)
+        d.text((120, y + 68), meta, font=F_T, fill=charte.DIM, anchor='lm')
+        d.text((106, y + 92), 'S1 = nouveau message', font=F_T,
+               fill=(90, 95, 110), anchor='lm')
+
+    def _rg_ghpage(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        pl = self.pl or {}
+        is_pr = pl.get('kind') == 'pull'
+        key = (pl.get('repo'), pl.get('kind'), pl.get('n'))
+        c = self.ghd.get(key) or {}
+        data = c.get('data')
+        caps = [
+            (charte.ico_link, 'Lien', '', None, False),
+            (charte.ico_copy, 'Titre', '' if data else 'n/a', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_copy, 'Fichiers' if is_pr else 'Corps', '',
+             None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'PR' if is_pr else 'ISSUE',
+                   charte.PURPLE if is_pr else charte.GREEN)
+        d.text((106, 26), '#{}'.format(pl.get('n', '?')), font=fipui.font(26),
+               fill=charte.FG, anchor='lm')
+        d.text((160, 24), (pl.get('repo') or '?')[:24], font=F_XS,
+               fill=charte.DIM, anchor='lm')
+        d.text((160, 42), 'github.com', font=F_T, fill=(90, 95, 110),
+               anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        if not c:
+            d.text((210, 100), 'chargement gh...', font=F_XS,
+                   fill=charte.DIM, anchor='mm')
+            return
+        if data is None:
+            d.text((210, 90), 'gh:', font=F_XS, fill=charte.DIM, anchor='mm')
+            d.text((210, 108), c.get('err', '?')[:34], font=F_XS,
+                   fill=charte.RED, anchor='mm')
+            return
+        # etat
+        state = (data.get('state') or '?').upper()
+        scol = charte.GREEN if state == 'OPEN' else (
+            charte.PURPLE if state == 'MERGED' else charte.RED)
+        x = 106
+        x += charte.pill(d, x, 80, charte.ico_check, state, scol) + 8
+        who = (data.get('author') or {}).get('login', '?')
+        x += charte.pill(d, x, 80, charte.ico_star, who[:14], charte.BLUE) + 8
+        charte.pill(d, x, 80, charte.ico_issue,
+                    '{} comm.'.format(len(data.get('comments') or [])),
+                    charte.DIM)
+        d.text((106, 104), 'TITRE', font=F_T, fill=charte.DIM, anchor='lm')
+        import textwrap
+        yy = 122
+        for ln in textwrap.wrap(data.get('title') or '?', 34)[:3]:
+            d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
+            yy += 17
+        if is_pr:
+            add = data.get('additions') or 0
+            dele = data.get('deletions') or 0
+            d.text((106, yy + 8), '+{}'.format(add), font=F_XS,
+                   fill=charte.GREEN, anchor='lm')
+            d.text((170, yy + 8), '-{}'.format(dele), font=F_XS,
+                   fill=charte.RED, anchor='lm')
+            d.text((230, yy + 8), '{} reviews'.format(
+                len(data.get('reviews') or [])), font=F_T,
+                   fill=charte.DIM, anchor='lm')
+        d.text((106, yy + 28), 'cree ' + charte.ago(data.get('createdAt')),
+               font=F_T, fill=(90, 95, 110), anchor='lm')
+
+    def _rg_hf(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        model = self.pl or '?'
+        c = self.hfd.get(model) or {}
+        data = c.get('data')
+        caps = [
+            (charte.ico_copy, 'ID', '', None, False),
+            (charte.ico_link, 'Page', '', None, False),
+            (charte.ico_terminal, 'Cmd', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'HF', (240, 200, 60))
+        d.rounded_rectangle((106, 12, 146, 52), radius=8, fill=(48, 40, 12),
+                            outline=(240, 200, 60))
+        charte.ico_star(d, 126, 32, 12, (240, 200, 60))
+        import textwrap
+        lines = textwrap.wrap(model, 26)[:2] or [model[:26]]
+        d.text((152, 20), lines[0], font=F_S, fill=charte.FG, anchor='lm')
+        if len(lines) > 1:
+            d.text((152, 40), lines[1], font=F_XS, fill=charte.DIM,
+                   anchor='lm')
+        else:
+            d.text((152, 42), 'huggingface.co', font=F_T,
+                   fill=(90, 95, 110), anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        if not c:
+            d.text((210, 100), 'chargement HF...', font=F_XS,
+                   fill=charte.DIM, anchor='mm')
+            return
+        if data is None:
+            d.text((210, 100), c.get('err', '?')[:34], font=F_XS,
+                   fill=charte.RED, anchor='mm')
+            return
+        x = 106
+        x += charte.pill(d, x, 80, charte.ico_star,
+                         str(data.get('likes', 0)), charte.ORANGE) + 8
+        dl = data.get('downloads') or 0
+        x += charte.pill(d, x, 80, charte.ico_branch,
+                         '{:.0f}k'.format(dl / 1000) if dl >= 1000
+                         else str(dl), charte.BLUE) + 8
+        if data.get('pipeline_tag'):
+            charte.pill(d, x, 80, charte.ico_window,
+                        data['pipeline_tag'][:12], charte.PURPLE)
+        d.text((106, 104), 'MODELE', font=F_T, fill=charte.DIM, anchor='lm')
+        rows = []
+        if data.get('library_name'):
+            rows.append('librairie ' + data['library_name'])
+        if data.get('lastModified'):
+            rows.append('maj ' + str(data['lastModified'])[:10])
+        tg = [t for t in (data.get('tags') or [])
+              if ':' not in t and len(t) < 14][:5]
+        if tg:
+            rows.append(' '.join(tg))
+        yy = 122
+        for r in rows[:5]:
+            d.text((106, yy), r[:36], font=F_XS, fill=charte.FG, anchor='lm')
+            yy += 17
+        d.text((106, yy + 8), 'S3 = copier huggingface-cli download',
                font=F_T, fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):

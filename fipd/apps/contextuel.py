@@ -160,6 +160,7 @@ class ContextuelApp(App):
         self.hfd = {}                  # modele HF -> {'t', 'data'}
         self.ddg = {}                  # requete -> {'t', 'data', 'img'}
         self.wiki = {}                 # (lang, titre) -> {'t', 'data', 'img'}
+        self.gsc = None                # {'t', 'm': {clics, impressions,...}}
         self._inflight = set()         # cles de fetch en cours (sans blocage)
         self._busy2 = threading.Lock()     # serialise les fetchs detailles
         self.exp_sel = []              # fichiers selectionnes (explorer)
@@ -242,6 +243,11 @@ class ContextuelApp(App):
                     self._inflight.add(fk)
                     threading.Thread(target=self._fetch_wiki, args=(dict(pl),),
                                      daemon=True).start()
+            if kind == 'gsc' and \
+                    (self.gsc is None or time.time() - self.gsc['t'] > 8) \
+                    and 'gsc' not in self._inflight:
+                self._inflight.add('gsc')
+                threading.Thread(target=self._fetch_gsc, daemon=True).start()
             if kind == 'explorer':
                 self.exp_sel = self._explorer_sel()
             changed = (repo, kind, pl, proc, title[:60]) != last
@@ -317,9 +323,14 @@ class ContextuelApp(App):
             if bl.endswith('- recherche google') \
                     or bl.endswith('- google search'):
                 return 'gsearch', url, tab
+            if bl.startswith('performances dans les résultats') \
+                    or 'search console' in bl:
+                return 'gsc', url, tab
             # --- ensuite par URL (precis, mais potentiellement en retard)
             host = urlsplit(url).netloc.lower()
             path = urlsplit(url).path
+            if host == 'search.google.com' and 'search-console' in url:
+                return 'gsc', url, tab
             if host == 'mail.google.com':
                 return 'gmail', url, tab
             if host in ('www.google.com', 'google.com', 'www.google.fr',
@@ -607,6 +618,74 @@ class ContextuelApp(App):
             self._inflight.discard(fk)
             self.d._redraw_now()
 
+    def _fetch_gsc(self):
+        """Search Console : LIT la page affichee via l'arbre d'accessibilite.
+        Le walk s'execute DANS le thread UIA dedie (uiatabs) — l'objet COM
+        global du paquet n'est pas utilisable depuis un autre thread."""
+        import uiatabs
+
+        def read_page():
+            import uiautomation as auto
+            c = auto.ControlFromHandle(self.hwnd)
+            texts = []
+            t0 = time.time()
+
+            def walk(ctrl, depth):
+                if depth > 40 or len(texts) > 5000 \
+                        or time.time() - t0 > 3.0:
+                    return
+                try:
+                    kids = ctrl.GetChildren()
+                except Exception:
+                    return
+                for ch in kids:
+                    try:
+                        n = (ch.Name or '').strip()
+                        if n and len(n) < 120:
+                            texts.append(n)
+                    except Exception:
+                        pass
+                    walk(ch, depth + 1)
+
+            if c is not None:
+                walk(c, 0)
+            return texts
+
+        metrics = None
+        try:
+            texts = uiatabs.run_in_uia_thread(read_page) or []
+
+            def grab(label):
+                lab = label.lower()
+                for i, t in enumerate(texts):
+                    tl = t.strip().lower()
+                    if tl == lab:
+                        for j in range(i + 1, min(i + 4, len(texts))):
+                            v = texts[j].strip()
+                            if v.lower() != lab and re.match(
+                                    r'^[\d\u202f\u00a0 .,kKmM%]+$', v):
+                                return v
+                    if tl.startswith(lab):
+                        rest = t[len(label):].strip()
+                        if rest:
+                            return rest
+                return None
+
+            metrics = {
+                'clics': grab('Nombre total de clics')
+                or grab('Total clicks'),
+                'impressions': grab("Nombre total d'impressions")
+                or grab('Total impressions'),
+                'ctr': grab('CTR moyen') or grab('Average CTR'),
+                'position': grab('Position moyenne')
+                or grab('Average position'),
+            }
+        except Exception as e:
+            print('[gsc]', str(e)[:60], flush=True)
+        self.gsc = {'t': time.time(), 'm': metrics}
+        self._inflight.discard('gsc')
+        self.d._redraw_now()
+
     def _fetch_wiki(self, pl):
         """Resume d'article Wikipedia via l'API REST officielle."""
         key = (pl['lang'], pl['title'])
@@ -725,6 +804,31 @@ class ContextuelApp(App):
             elif n == 4:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (tab.get('title') or host)
+                                .replace(' ', '+'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'gsc':
+            import keysend
+            if n == 1:
+                clipboard_set(self.pl or '')
+                self.alert('URL copiee')
+            elif n == 2:
+                clipboard_set(tab.get('title') or '')
+                self.alert('titre copie')
+            elif n == 3:
+                m = (self.gsc or {}).get('m') or {}
+                clipboard_set('Clics {} | Impressions {} | CTR {} | '
+                              'Position {}'.format(
+                                  m.get('clics') or '?',
+                                  m.get('impressions') or '?',
+                                  m.get('ctr') or '?',
+                                  m.get('position') or '?'))
+                self.alert('valeurs copiees')
+            elif n == 4:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (tab.get('title') or 'search console')
                                 .replace(' ', '+'))
             elif n == 5:
                 keysend.tap('volumedown')
@@ -1164,6 +1268,7 @@ class ContextuelApp(App):
         return {'process': self.proc, 'title': self.wtitle[:100],
                 'kind': self.kind, 'payload': repr(self.pl)[:120],
                 'ans': ans,
+                'gsc': (self.gsc or {}).get('m'),
                 'repo': self.repo, 'pending': self.pending,
                 'stars': c['data'].get('stargazers_count') if c else None,
                 'issues': c['data'].get('open_issues_count') if c else None,
@@ -1323,6 +1428,8 @@ class ContextuelApp(App):
             self._rg_chat(img, d)
         elif self.kind == 'wiki':
             self._rg_wiki(img, d)
+        elif self.kind == 'gsc':
+            self._rg_gsc(img, d)
         else:
             self._rg_default(img, d)
 
@@ -2266,6 +2373,55 @@ class ContextuelApp(App):
             th_h = 134 * 7 // len(lines)
             ty = 100 + (134 - th_h) * self.scroll // max(1, len(lines) - 7)
             d.rectangle((314, ty, 316, ty + th_h), fill=charte.BLUE)
+
+    def _rg_gsc(self, img, d):
+        """Search Console : metriques lues SUR LA PAGE (arbre UIA)."""
+        F_T = fipui.font(11)
+        F_XS = fipui.font(13)
+        caps = [
+            (charte.ico_link, 'URL', '', None, False),
+            (charte.ico_copy, 'Titre', '', None, False),
+            (charte.ico_copy, 'Valeurs', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'GSC', (70, 140, 250))
+        d.text((106, 28), 'Performances', font=fipui.font(15),
+               fill=charte.FG, anchor='lm')
+        d.text((106, 48), 'search console · lecture ecran', font=F_T,
+               fill=charte.DIM, anchor='lm')
+        m = (self.gsc or {}).get('m')
+        if m is None and self.gsc is None:
+            d.text((210, 110), 'lecture de la page...', font=F_XS,
+                   fill=charte.DIM, anchor='mm')
+            return
+        tiles = [
+            ('CLICS', m and m.get('clics'), charte.GREEN),
+            ('IMPRESSIONS', m and m.get('impressions'), charte.BLUE),
+            ('CTR', m and m.get('ctr'), charte.PURPLE),
+            ('POSITION', m and m.get('position'), charte.ORANGE),
+        ]
+        for i, (lab, val, col) in enumerate(tiles):
+            x0 = 106 + (i % 2) * 106
+            y0 = 66 + (i // 2) * 56
+            d.rounded_rectangle((x0, y0, x0 + 100, y0 + 50), radius=8,
+                                fill=charte.CARD, outline=col)
+            d.text((x0 + 8, y0 + 11), lab, font=F_T, fill=charte.DIM,
+                   anchor='lm')
+            v = val if val else '—'
+            f = fipui.font(24 if len(v) <= 6 else 18)
+            d.text((x0 + 8, y0 + 33), v, font=f, fill=col, anchor='lm')
+        d.text((106, 190), 'MAJ auto 8 s — change la periode ou les filtres',
+               font=F_T, fill=(90, 95, 110), anchor='lm')
+        d.text((106, 206), 'dans Chrome, la fiche suit.', font=F_T,
+               fill=(90, 95, 110), anchor='lm')
+        d.text((106, 228), 'S3 = copier les 4 valeurs', font=F_T,
+               fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

@@ -82,7 +82,11 @@ pour exposer `/app/<name>`) :
   nouveau message (compose) ; **page GitHub PR/Issue** → `gh pr/issue view` :
   état, auteur, +additions/-deletions, reviews, commentaires, titre ;
   **modèle HuggingFace** → API publique : likes, downloads, pipeline,
-  librairie, `huggingface-cli download` copié en 1 bouton ; **recherche Google** → requête + **résultat de
+  librairie, `huggingface-cli download` copié en 1 bouton ; **Search Console** 🆕 → le FIP **lit la page affichée**
+  (arbre d'accessibilité, exécution dans le thread UIA dédié) et affiche
+  les 4 métriques : Clics / Impressions / CTR / Position — MAJ auto 8 s,
+  suit les changements de filtres/période ; S3 copie les 4 valeurs ;
+  **recherche Google** → requête + **résultat de
   calcul local** (AST sûr, ex. 3*1.25 = 3.75 affiché sur le FIP) ou
   **réponse instantanée DuckDuckGo** (réponse directe, sujet + extrait +
   image) pour les requêtes normales + Lucky / Images / Actualités ;

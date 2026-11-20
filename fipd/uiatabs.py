@@ -33,8 +33,22 @@ _snap = []                      # [{'hwnd','proc','title','url','tabs':[...] }]
 _last_url = {}                  # hwnd -> (url, t) : URL collante anti-flicker
 _el_cache = {}                  # hwnd -> {'edit': ctrl, 'strip': ctrl}
 _last_state = {}                # hwnd -> {'url','tabs'} : dernier etat UIA
-_stop = threading.Event()
+_jobs = []                      # [(fn, queue)] : taches a executer DANS le
+_stop = threading.Event()       # thread UIA (meme appartement COM)
 _started = False
+
+
+def run_in_uia_thread(fn, timeout=8):
+    """Execute fn dans le thread UIA dedie (l'objet COM global du paquet
+    uiautomation appartient a ce thread — les appels d'un autre thread
+    echouent silencieusement). Retourne le resultat ou None."""
+    import queue
+    q = queue.Queue()
+    _jobs.append((fn, q))
+    try:
+        return q.get(timeout=timeout)
+    except Exception:
+        return None
 
 
 def _publish(snap):
@@ -236,6 +250,12 @@ def _loop():
             _uia_pass()
         except Exception as e:
             print('[uiatabs]', e, flush=True)
+        while _jobs:                 # taches deleguees (lecture de pages...)
+            fn, q = _jobs.pop(0)
+            try:
+                q.put(fn())
+            except Exception as e:
+                q.put(e)
         _stop.wait(REFRESH_S)
 
 

@@ -66,27 +66,25 @@ option `render_full(img)` pour coller des images ; option `http_get/http_post`
 pour exposer `/app/<name>`) :
 - - **FENETRES** — toutes les **fenêtres ouvertes** (EnumWindows : z-order,
   processus, états premier plan/minimisée/toujours devant) + tous les
-  **onglets Chrome** (via l'extension `extension_fip/`). Layout 30/70 :
-  keycaps contextuels de l'entrée sélectionnée (molette droite = curseur) —
-  fenêtre : Focus/Minimiser/Devant/Fermer 2×/Tuer 2×/Copier titre ; onglet :
-  Activer (+focus fenêtre)/Fermer/Recharger/Épingler/Fermer les autres 2×/
-  Copier URL. **Installation extension (1×)** : Chrome → `chrome://extensions`
-  → Mode développeur → « Charger l'extension non empaquetée » → sélectionner
-  `fipd/extension_fip/`. Contrat : `POST /app/fenetres {tabs:[…]}` +
-  `GET /app/fenetres?cursor=N` → `{cmd, cursor}` (activation/fermeture/
-  rechargement/épinglage pilotés depuis le FIP).
-- **CONTEXTE** — page caméléon : s'adapte à la **fenêtre active** (processus +
-  titre ; le titre d'un navigateur = onglet actif). **Layout 2 colonnes
-  30/70 : gauche = 6 keycaps pleine hauteur alignées sur les boutons
-  physiques, droite = panneau d'infos.** Onglet GitHub → fiche repo (avatar
-  propriétaire, étoiles/issues/PR en pills, points des derniers runs,
-  workflow, PR ouverte, description) et S1-S6 = Issues/PRs/Actions/Repo/
-  copier URL/cmd clone. Autre fenêtre → 6 actions : copier titre /
-  **toujours devant** (topmost) / minimiser / tuer (2×) / **redémarrer**
-  (2×) / copier chemin exe ; panneau = avatar lettre, PID, dimensions,
-  titre défilable (molette droite). `GET /app/contexte` = contexte courant.
-  Rendu **charte graphique** (`charte.py` : palette GitHub Dark,
-  `panel`/`keycap`/`pill`/`ico_*`/`letter_avatar`/`ago` — réutilisable).
+  **onglets Chrome/Edge** via **UI Automation** (`uiatabs.py`, aucune
+  installation ni extension). Layout 30/70 : keycaps contextuels de l'entrée
+  sélectionnée (molette droite = curseur) — fenêtre : Focus/Minimiser/Devant/
+  Fermer 2×/Tuer 2×/Copier titre ; onglet : **Activer** (bascule UIA)/
+  Copier titre/Copier URL (onglet actif)/Google/Volume. Limites UIA :
+  onglets hors bande visible virtualisés absents, URL de l'onglet actif
+  uniquement.
+- **CONTEXTE** — page caméléon : s'adapte à la **fenêtre/onglet actif**.
+  **Layout 2 colonnes 30/70** (keycaps pleine hauteur alignées boutons /
+  panneau d'infos). Contextes : **onglet GitHub** → fiche repo (avatar,
+  stats, runs, PR, description ; S1-S6 = Issues/PRs/Actions/Repo/URL/Clone)
+  ; **onglet YouTube** → miniature + titre + chaîne (oEmbed, Lecture/Pause,
+  copies, Google, volume) ; **onglet web** → favicon + domaine + titre +
+  URL (copies, Google, domaine, volume) ; **app Windows** → avatar lettre +
+  PID + titre (Copier titre/Toujours devant/Minimiser/Tuer 2×/Redémarrer 2×/
+  Chemin exe). Onglets et URL via **UIA** (`uiatabs.py`), repli GitHub par
+  titre sans UIA. `GET /app/contexte` = contexte courant. Rendu **charte
+  graphique** (`charte.py` : palette GitHub Dark, `panel`/`keycap`/`pill`/
+  `ico_*`/`letter_avatar`/`ago` — réutilisable par toutes les apps).
 - **CAMERAS** — flux vidéo MJPEG/RTSP plein écran, liste sur S1-S6, molette
   droite = caméra suivante ; flux ajoutés via `POST /app/cameras`
   (`apps/cameras.json`)

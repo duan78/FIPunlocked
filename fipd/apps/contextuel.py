@@ -162,6 +162,7 @@ class ContextuelApp(App):
         self.wiki = {}                 # (lang, titre) -> {'t', 'data', 'img'}
         self.gsc = None                # {'t', 'm': {clics, impressions,...}}
         self.pages = {}                # url -> {'t', 'lines'} (lecture ecran)
+        self.ediseo = None             # {'t', 'k', 'm': {...metriques...}}
         self._title_t = 0.0            # horodatage du dernier changement de TITRE
         self._url_t = 0.0              # horodatage du dernier changement d'URL
         self._inflight = set()         # cles de fetch en cours (sans blocage)
@@ -265,6 +266,12 @@ class ContextuelApp(App):
                     self._inflight.add('gsc')
                     threading.Thread(target=self._fetch_gsc, args=(k,),
                                      daemon=True).start()
+            if kind == 'ediseo':
+                if (self.ediseo is None or time.time() - self.ediseo['t'] > 30) \
+                        and 'ediseo' not in self._inflight:
+                    self._inflight.add('ediseo')
+                    threading.Thread(target=self._fetch_ediseo,
+                                     daemon=True).start()
             if kind == 'explorer':
                 self.exp_sel = self._explorer_sel()
             changed = (repo, kind, pl, proc, title[:60]) != last
@@ -313,6 +320,13 @@ class ContextuelApp(App):
         app+None. L'URL de l'onglet (extension) prime sur le titre."""
         tab = self._fg_tab()
         if tab is not None:
+            # titre FRAIS : celui de la fenêtre Win32 (instantané), pas
+            # celui du snapshot UIA (jusqu'à 0,35 s de retard)
+            if self.proc in ('chrome.exe', 'msedge.exe') and self.wtitle:
+                for suf in (' - Google Chrome', ' - Microsoft Edge'):
+                    if self.wtitle.endswith(suf):
+                        tab['title'] = self.wtitle[:-len(suf)]
+                        break
             url = tab.get('url') or ''
             # --- TITRE D'ABORD : le titre UIA est immediat alors que l'URL
             # de la barre d'adresse peut trainer 3-4 s apres une bascule
@@ -325,6 +339,8 @@ class ContextuelApp(App):
                 return 'github', f'{m.group(1)}/{m.group(2)}', tab
             if bl.endswith('- youtube'):
                 return 'youtube', url, tab
+            if 'ediseo' in bl or ('sarenza' in bl and 'tableau' in bl):
+                return 'ediseo', url, tab
             if 'boîte de réception' in bl or bl.endswith('messagerie') \
                     or ' - gmail' in bl:
                 return 'gmail', url or 'https://mail.google.com/mail/u/0/', tab
@@ -687,6 +703,88 @@ class ContextuelApp(App):
         self._inflight.discard('page:' + url[:120])
         self.d._redraw_now()
 
+    def _fetch_ediseo(self):
+        """EdiSEO : lit le pipeline complet sur l'ecran (UIA)."""
+        import uiatabs
+
+        def read_page():
+            import uiautomation as auto
+            c = auto.ControlFromHandle(self.hwnd)
+            texts = []
+            t0 = time.time()
+
+            def walk(ctrl, depth):
+                if depth > 40 or len(texts) > 4000 \
+                        or time.time() - t0 > 3.0:
+                    return
+                try:
+                    kids = ctrl.GetChildren()
+                except Exception:
+                    return
+                for ch in kids:
+                    try:
+                        n = (ch.Name or '').strip()
+                        if n and len(n) < 200:
+                            texts.append(n)
+                    except Exception:
+                        pass
+                    walk(ch, depth + 1)
+
+            if c is not None:
+                walk(c, 0)
+            return texts
+
+        m = {}
+        try:
+            texts = uiatabs.run_in_uia_thread(read_page) or []
+            blob = ' | '.join(texts)
+
+            def grab_num(pattern):
+                r = re.search(pattern, blob)
+                if r:
+                    v = r.group(1).replace('\u202f', '').replace('\xa0', '') \
+                        .replace(' ', '').replace(',', '.')
+                    try:
+                        return float(v)
+                    except ValueError:
+                        return v
+                return None
+
+            # pipeline
+            m['importees'] = grab_num(r'(\d[\d\s\u202f\u00a0]*)\s*URLs?\s*import')
+            m['production'] = grab_num(
+                r'(\d[\d\s\u202f\u00a0]*)\s*En production')
+            m['generes'] = grab_num(
+                r'(\d[\d\s\u202f\u00a0]*)\s*Générés')
+            m['livrables'] = grab_num(
+                r'(\d[\d\s\u202f\u00a0]*)\s*livrables')
+            # génération LLM
+            m['gen_cours'] = grab_num(
+                r'Génération LLM.*?(\d+)\s*EN COURS')
+            m['gen_file'] = grab_num(
+                r'Génération LLM.*?(\d+)\s*EN FILE')
+            m['gen_err'] = grab_num(
+                r'Génération LLM.*?(\d+)\s*ERREURS')
+            r = re.search(r'Génération LLM.*?ETA\s*([^|]+?)(?:\s*\||$)',
+                          blob)
+            m['gen_eta'] = r.group(1).strip()[:20] if r else '—'
+            # juge
+            m['juge_cours'] = grab_num(r'Juge LLM.*?(\d+)\s*EN COURS')
+            m['juge_file'] = grab_num(r'Juge LLM.*?(\d+)\s*EN FILE')
+            r = re.search(r'Juge LLM.*?ETA\s*([^|]+?)(?:\s*\||$)', blob)
+            m['juge_eta'] = r.group(1).strip()[:20] if r else '—'
+            # crédits
+            m['serper'] = grab_num(r'(\d[\d\s\u202f\u00a0]*)\s*Crédits')
+            m['serper_max'] = grab_num(r'plafond\s*(\d[\d\s\u202f\u00a0]*)')
+            # dernière activité
+            r = re.search(r'Texte généré\s*(\d{2}:\d{2}:\d{2})', blob)
+            m['last_gen'] = r.group(1) if r else ''
+        except Exception as e:
+            print('[ediseo]', str(e)[:50], flush=True)
+        self.ediseo = {'t': time.time(), 'm': m}
+        self._inflight.discard('ediseo')
+        self.d._redraw_now()
+
     def _fetch_gsc(self, key=''):
         """Search Console : LIT la page affichee via l'arbre d'accessibilite.
         Le walk s'execute DANS le thread UIA dedie (uiatabs) — l'objet COM
@@ -873,6 +971,40 @@ class ContextuelApp(App):
             elif n == 4:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (tab.get('title') or host)
+                                .replace(' ', '+'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'ediseo':
+            import keysend
+            m = (self.ediseo or {}).get('m') or {}
+            if n == 1:
+                clipboard_set(
+                    'Import {:,.0f} | Prod {:,.0f} | Générés {:,.0f} | '
+                    'Livrables {:,.0f}'.format(
+                        m.get('importees') or 0, m.get('production') or 0,
+                        m.get('generes') or 0, m.get('livrables') or 0)
+                    .replace(',', ' '))
+                self.alert('pipeline copie')
+            elif n == 2:
+                clipboard_set(
+                    'Gen: {} cours / {} file (ETA {}) | '
+                    'Juge: {} cours / {} file (ETA {})'.format(
+                        int(m.get('gen_cours') or 0),
+                        int(m.get('gen_file') or 0), m.get('gen_eta') or '?',
+                        int(m.get('juge_cours') or 0),
+                        int(m.get('juge_file') or 0),
+                        m.get('juge_eta') or '?'))
+                self.alert('LLM copie')
+            elif n == 3:
+                clipboard_set('Serper {:,.0f} / {:,.0f}'.format(
+                    m.get('serper') or 0,
+                    m.get('serper_max') or 0).replace(',', ' '))
+                self.alert('credits copies')
+            elif n == 4:
+                webbrowser.open('https://www.google.com/search?q='
+                                'sarenza ediseo seo pipeline'
                                 .replace(' ', '+'))
             elif n == 5:
                 keysend.tap('volumedown')
@@ -1503,6 +1635,8 @@ class ContextuelApp(App):
             self._rg_wiki(img, d)
         elif self.kind == 'gsc':
             self._rg_gsc(img, d)
+        elif self.kind == 'ediseo':
+            self._rg_ediseo(img, d)
         else:
             self._rg_default(img, d)
 
@@ -2508,6 +2642,113 @@ class ContextuelApp(App):
                font=F_T, fill=(90, 95, 110), anchor='lm')
         d.text((106, 214), 'S3 = copier les 4 valeurs · S4 = relire',
                font=F_T, fill=(90, 95, 110), anchor='lm')
+
+    def _rg_ediseo(self, img, d):
+        """EdiSEO : pipeline SEO complet — funnel, pools LLM, credits."""
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        caps = [
+            (charte.ico_copy, 'Pipeline', '', None, False),
+            (charte.ico_copy, 'LLM', '', None, False),
+            (charte.ico_copy, 'Crédits', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'SEO', charte.TEAL)
+        m = (self.ediseo or {}).get('m')
+        if m is None and self.ediseo is None:
+            d.text((210, 110), 'lecture du pipeline...', font=F_XS,
+                   fill=charte.DIM, anchor='mm')
+            return
+        if not m:
+            d.text((210, 100), 'extraction echouee', font=F_XS,
+                   fill=charte.RED, anchor='mm')
+            return
+        d.text((106, 26), 'EdiSEO Pipeline', font=F_S, fill=charte.FG,
+               anchor='lm')
+        if m.get('last_gen'):
+            d.text((106, 47), 'dernier texte généré à ' + m['last_gen'],
+                   font=F_T, fill=charte.GREEN, anchor='lm')
+        else:
+            d.text((106, 47), 'sarenza · pipeline auto actif', font=F_T,
+                   fill=charte.DIM, anchor='lm')
+        # entonnoir compact
+        d.line((106, 60, 313, 60), fill=charte.BORDER)
+        stages = [
+            ('Import', m.get('importees'), charte.DIM),
+            ('Prod', m.get('production'), charte.BLUE),
+            ('DSR', m.get('generes'), charte.PURPLE),
+            ('Livrables', m.get('livrables'), charte.GREEN),
+        ]
+        max_v = max(v for _, v, _ in stages if isinstance(v, (int, float))
+                    ) if any(isinstance(v, (int, float))
+                             for _, v, _ in stages) else 1
+        for i, (lab, val, col) in enumerate(stages):
+            y = 68 + i * 16
+            d.text((106, y), '{:>10s}'.format(lab), font=F_T, fill=col,
+                   anchor='lm')
+            if isinstance(val, (int, float)):
+                w = int(120 * val / max_v)
+                d.rectangle((170, y - 5, 170 + max(2, w), y + 4), fill=col)
+                d.text((296, y), '{:>6.0f}'.format(val), font=F_T,
+                       fill=charte.FG, anchor='lm')
+            else:
+                d.text((296, y), '—', font=F_T, fill=charte.DIM,
+                       anchor='lm')
+        # pools actifs
+        d.line((106, 134, 313, 134), fill=charte.BORDER)
+        gen_on = isinstance(m.get('gen_cours'), (int, float)) \
+            and m['gen_cours'] > 0
+        d.rounded_rectangle((106, 142, 206, 180), radius=6,
+                            fill=(14, 34, 20) if gen_on else charte.CARD,
+                            outline=charte.GREEN if gen_on else charte.BORDER)
+        d.text((114, 152), '③ Génération', font=F_T, fill=charte.GREEN,
+               anchor='lm')
+        d.text((114, 168),
+               '{} cours · {} file'.format(
+                   int(m.get('gen_cours') or 0),
+                   int(m.get('gen_file') or 0)), font=F_T,
+               fill=charte.FG, anchor='lm')
+        if m.get('gen_eta') and m['gen_eta'] != '—':
+            d.text((114, 175), 'ETA ' + m['gen_eta'][:12], font=F_T,
+                   fill=charte.DIM, anchor='lm')
+        jug_on = isinstance(m.get('juge_cours'), (int, float)) \
+            and m['juge_cours'] > 0
+        d.rounded_rectangle((214, 142, 313, 180), radius=6,
+                            fill=(14, 34, 20) if jug_on else charte.CARD,
+                            outline=charte.GREEN if jug_on else charte.BORDER)
+        d.text((222, 152), '⚖ Juge', font=F_T, fill=charte.GREEN,
+               anchor='lm')
+        d.text((222, 168),
+               '{} cours · {} file'.format(
+                   int(m.get('juge_cours') or 0),
+                   int(m.get('juge_file') or 0)), font=F_T,
+               fill=charte.FG, anchor='lm')
+        if m.get('juge_eta') and m['juge_eta'] != '—':
+            d.text((222, 175), 'ETA ' + m['juge_eta'][:12], font=F_T,
+                   fill=charte.DIM, anchor='lm')
+        # crédits
+        d.line((106, 188, 313, 188), fill=charte.BORDER)
+        sv = m.get('serper')
+        sm = m.get('serper_max')
+        if isinstance(sv, (int, float)) and isinstance(sm, (int, float)) \
+                and sm > 0:
+            d.text((106, 200), 'Serper {:,.0f} / {:,.0f}'.format(
+                sv, sm).replace(',', ' '), font=F_XS, fill=charte.FG,
+                anchor='lm')
+            charte.draw_bar(d, 106, 212, 313, 222, sv / sm,
+                            charte.ORANGE if sv / sm > 0.8 else charte.BLUE)
+        else:
+            d.text((106, 200), 'Serper —', font=F_XS, fill=charte.DIM,
+                   anchor='lm')
+        d.text((106, 230), 'MAJ 30 s · S1-S3 copier', font=F_T,
+               fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

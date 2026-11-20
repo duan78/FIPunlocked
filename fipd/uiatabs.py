@@ -20,12 +20,14 @@ u32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM),
 u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
 
 BROWSERS = ('chrome.exe', 'msedge.exe')
-REFRESH_S = 3.0
+REFRESH_S = 1.2            # un scan complet ne prend que ~0,2 s
+URL_STICKY_S = 15.0        # garder la derniere URL connue si lecture rate
 BROWSER_SUFFIXES = (' - Google Chrome', ' - Microsoft\xad Edge', ' - Mozilla Firefox',
                     ' - Brave', ' - Opera', ' - Vivaldi')
 
 _lock = threading.Lock()
 _snap = []                      # [{'hwnd','proc','title','url','tabs':[...] }]
+_last_url = {}                  # hwnd -> (url, t) : URL collante anti-flicker
 _stop = threading.Event()
 _started = False
 
@@ -89,10 +91,15 @@ def _scan():
                         if not v.startswith('http'):
                             v = 'https://' + v   # UIA rend l'URL sans schema
                         entry['url'] = v
+                        _last_url[h] = (v, time.time())
                         break
                 except Exception:
                     pass
                 edit = edit.GetNextSiblingControl()
+            if not entry['url']:
+                last = _last_url.get(h)
+                if last and time.time() - last[1] < URL_STICKY_S:
+                    entry['url'] = last[0]    # lecture ratee : derniere connue
             # onglets : enfants du TabControl du bandeau (hors contenu web)
             tabs_ctrl = c.TabControl(searchDepth=30)
             if tabs_ctrl is not None:

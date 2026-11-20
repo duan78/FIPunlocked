@@ -149,9 +149,10 @@ class ContextuelApp(App):
         self.pending = None            # candidate en cours de validation
         self.invalid = set()           # candidats rejetes par gh
         self.cache = {}                # repo -> {'t', 'data', 'prs', 'runs'}
-        self.tab = None                # onglet actif (extension Chrome)
+        self.tab = None                # onglet actif (UIA)
         self.kind = 'app'              # github | youtube | site | app
         self.pl = None                 # payload du contexte (repo/url)
+        self.tab_since = 0.0           # debut du contexte courant (duree)
         self.yt = {}                   # url youtube -> {'data', 'img'}
         self.fav = {}                  # host -> favicon PIL (ou None)
         self.scroll = 0
@@ -198,6 +199,9 @@ class ContextuelApp(App):
                 if host and host not in self.fav:
                     self._fav_fetch(host)
             changed = (repo, kind, pl, proc, title[:60]) != last
+            if pl != getattr(self, '_last_pl', None):
+                self._last_pl = pl
+                self.tab_since = time.time()      # nouveau contexte = chrono
             if repo != self.repo:
                 self.repo = repo
                 self.scroll = 0
@@ -513,6 +517,30 @@ class ContextuelApp(App):
         except Exception:
             return None
 
+    def _tab_pos(self):
+        """(index_actif, total) des onglets de la fenetre au premier plan."""
+        if not self.hwnd:
+            return None, 0
+        try:
+            import uiatabs
+            for e in uiatabs.snapshot():
+                if e['hwnd'] == self.hwnd:
+                    for i, t in enumerate(e['tabs']):
+                        if t['active']:
+                            return i + 1, len(e['tabs'])
+                    return None, len(e['tabs'])
+        except Exception:
+            pass
+        return None, 0
+
+    def _duree(self):
+        s = int(time.time() - self.tab_since) if self.tab_since else 0
+        if s < 60:
+            return '{} s'.format(s)
+        if s < 3600:
+            return '{} min'.format(s // 60)
+        return '{} h{:02d}'.format(s // 3600, (s % 3600) // 60)
+
     # ---------- rendu (charte graphique) ----------
 
     def render_full(self, img):
@@ -698,18 +726,25 @@ class ContextuelApp(App):
         if data.get('author_name'):
             d.text((106, yy + 4), data['author_name'], font=F_T,
                    fill=charte.DIM, anchor='lm')
+        pos, tot = self._tab_pos()
+        if pos:
+            charte.ico_window(d, 111, yy + 24, 4, charte.DIM)
+            d.text((120, yy + 24), 'onglet {}/{}  ·  {}'.format(
+                pos, tot, self._duree()), font=F_T, fill=charte.DIM,
+                anchor='lm')
 
     def _rg_site(self, img, d):
         F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         tab = self.tab or {}
-        host = urlsplit(self.pl or '').netloc
+        u = urlsplit(self.pl or '')
+        host = u.netloc
         caps = [
             (charte.ico_link, 'URL', '', None, False),
             (charte.ico_copy, 'Titre', '', None, False),
-            (charte.ico_home, 'Google', '', None, False),
             (charte.ico_copy, 'Domaine', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
             (charte.ico_min, 'Vol-', '', None, False),
             (charte.ico_min, 'Vol+', '', None, False),
         ]
@@ -718,6 +753,7 @@ class ContextuelApp(App):
                           hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
         charte.panel(d, (98, 4, 317, 238))
         self._chip(d, 311, 10, 'WEB', charte.TEAL)
+        # en-tete : favicon + domaine (comme avatar + repo de la fiche GitHub)
         fav = self.fav.get(host)
         if fav is not None:
             f2 = fav.resize((36, 36))
@@ -725,22 +761,40 @@ class ContextuelApp(App):
         else:
             av = charte.letter_avatar(host, 36, 8)
             img.paste(av, (106, 12), charte.rounded(av, 8))
-        h2 = host.replace('www.', '')[:24]
-        d.text((152, 30), h2, font=F_S, fill=charte.FG, anchor='lm')
+        h2 = host.replace('www.', '')
+        while h2 and d.textlength(h2, font=F_S) > 150:
+            h2 = h2[:-1]
+        d.text((152, 24), h2, font=F_S, fill=charte.FG, anchor='lm')
+        pos, tot = self._tab_pos()
+        charte.ico_clock(d, 157, 45, 4, charte.DIM)
+        meta = self._duree()
+        if pos:
+            meta += '   onglet {}/{}'.format(pos, tot)
+        d.text((166, 45), meta, font=F_T, fill=charte.DIM, anchor='lm')
+        # zone URL
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        d.text((106, 76), 'URL', font=F_T, fill=charte.DIM, anchor='lm')
+        v = self.pl or ''
+        while v and d.textlength(v, font=F_T) > 165:
+            v = v[:-1]
+        d.text((140, 76), v, font=F_T, fill=(120, 160, 230), anchor='lm')
+        # zone titre (grand, comme le nom du repo)
+        d.line((106, 92, 313, 92), fill=charte.BORDER)
+        d.text((106, 104), 'TITRE', font=F_T, fill=charte.DIM, anchor='lm')
         import textwrap
-        lines = textwrap.wrap(tab.get('title') or host, 32)[:3] or [' ']
-        yy = 68
-        d.text((106, yy), 'TITRE', font=F_T, fill=charte.DIM, anchor='lm')
-        yy += 16
+        lines = textwrap.wrap(tab.get('title') or host, 34)[:4] or [' ']
+        yy = 124
         for ln in lines:
             d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
             yy += 17
-        d.text((106, yy + 6), 'URL', font=F_T, fill=charte.DIM, anchor='lm')
-        yy += 22
-        for ln in textwrap.wrap(self.pl or '', 44)[:2]:
-            d.text((106, yy), ln, font=F_T, fill=(110, 118, 129),
-                   anchor='lm')
-            yy += 13
+        # bas de panneau : chemin de l'URL
+        d.line((106, 196, 313, 196), fill=charte.BORDER)
+        path = (u.path + ('?' + u.query[:24] if u.query else '')) or '/'
+        while path and d.textlength(path, font=F_T) > 200:
+            path = path[:-1]
+        d.text((106, 210), path, font=F_T, fill=(110, 118, 129), anchor='lm')
+        d.text((106, 226), 'fenetre: ' + self.proc, font=F_T,
+               fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

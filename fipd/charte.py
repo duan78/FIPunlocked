@@ -208,6 +208,12 @@ def ico_mail(d, cx, cy, r, col):
     d.line((cx, cy + 1, cx + r, cy - r + 3), fill=col, width=2)
 
 
+def ico_search(d, cx, cy, r, col):
+    d.ellipse((cx - r, cy - r, cx + r - 2, cy + r - 2), outline=col, width=2)
+    d.line((cx + r - 3, cy + r - 3, cx + r + 2, cy + r + 2), fill=col,
+           width=2)
+
+
 # ---------- avatars ----------
 
 def _hash_color(name):

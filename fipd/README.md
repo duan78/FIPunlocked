@@ -82,7 +82,10 @@ pour exposer `/app/<name>`) :
   nouveau message (compose) ; **page GitHub PR/Issue** → `gh pr/issue view` :
   état, auteur, +additions/-deletions, reviews, commentaires, titre ;
   **modèle HuggingFace** → API publique : likes, downloads, pipeline,
-  librairie, `huggingface-cli download` copié en 1 bouton ; **onglet web**
+  librairie, `huggingface-cli download` copié en 1 bouton ; **recherche Google** → requête + **résultat de
+  calcul local** (AST sûr, ex. 3*1.25 = 3.75 affiché sur le FIP) + Lucky /
+  Images / Actualités ; **chat IA** (z.ai, ChatGPT, Claude, Le Chat) →
+  conversation + accueil/nouvelle discussion ; **onglet web**
   → favicon + domaine + titre +
   URL (copies, Google, domaine, volume) ; **app Windows** → fiches par
   application : **Explorateur** (chemin réel via COM Shell.Application,

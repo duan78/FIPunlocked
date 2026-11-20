@@ -273,6 +273,13 @@ class ContextuelApp(App):
             path = urlsplit(url).path
             if host == 'mail.google.com':
                 return 'gmail', url, tab
+            if host in ('www.google.com', 'google.com', 'www.google.fr',
+                        'google.fr') and path == '/search':
+                return 'gsearch', url, tab
+            if host in ('z.ai', 'chat.z.ai', 'chatgpt.com',
+                        'chat.openai.com', 'claude.ai', 'poe.com',
+                        'lechat.mistral.ai'):
+                return 'chat', url, tab
             if host.endswith('huggingface.co'):
                 m = re.match(r'^/([\w.-]+)/([\w.-]+)/?$', path)
                 if m and m.group(1) not in (
@@ -532,7 +539,50 @@ class ContextuelApp(App):
             return
         n = int(name[1])
         tab = self.tab or {}
-        if self.kind == 'gmail':
+        if self.kind == 'gsearch' and self.pl:
+            import keysend
+            from urllib.parse import parse_qs as _pqs, quote_plus as _qp
+            q = (_pqs(urlsplit(self.pl).query).get('q') or [''])[0]
+            if n == 1:
+                clipboard_set(q)
+                self.alert('requete copiee')
+            elif n == 2:                      # I'm feeling lucky
+                os.startfile('https://www.google.com/search?q=' + _qp(q)
+                             + '&btnI')
+                self.alert('lucky...')
+            elif n == 3:
+                os.startfile('https://www.google.com/search?q=' + _qp(q)
+                             + '&tbm=isch')
+                self.alert('images')
+            elif n == 4:
+                os.startfile('https://www.google.com/search?q=' + _qp(q)
+                             + '&tbm=nws')
+                self.alert('actualites')
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'chat' and self.pl:
+            import keysend
+            host = urlsplit(self.pl).netloc
+            if n == 1:
+                clipboard_set(tab.get('title') or '')
+                self.alert('titre copie')
+            elif n == 2:
+                clipboard_set(self.pl)
+                self.alert('URL copiee')
+            elif n == 3:                      # nouvelle conversation
+                os.startfile('https://' + host + '/')
+                self.alert('accueil ' + host)
+            elif n == 4:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (tab.get('title') or host)
+                                .replace(' ', '+'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'gmail':
             import keysend
             m2 = re.search(r'-\s*([\w.+-]+@[\w.-]+)', tab.get('title') or '')
             if n == 1:                        # nouveau message
@@ -937,6 +987,35 @@ class ContextuelApp(App):
             return None
 
     @staticmethod
+    def _calc(expr):
+        """Calculatrice sure (AST, aucune evaluation libre). None si non calc."""
+        import ast
+        import operator
+        expr = (expr.replace('^', '**').replace('×', '*')
+                .replace('÷', '/').replace(',', '.'))
+        if not re.fullmatch(r'[\d\s+\-*/().%]+', expr or ''):
+            return None
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub,
+               ast.Mult: operator.mul, ast.Div: operator.truediv,
+               ast.Pow: operator.pow, ast.Mod: operator.mod,
+               ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+        def ev(n):
+            if isinstance(n, ast.Constant) and \
+                    isinstance(n.value, (int, float)):
+                return n.value
+            if isinstance(n, ast.BinOp) and type(n.op) in ops:
+                return ops[type(n.op)](ev(n.left), ev(n.right))
+            if isinstance(n, ast.UnaryOp) and type(n.op) in ops:
+                return ops[type(n.op)](ev(n.operand))
+            raise ValueError('nope')
+
+        try:
+            return round(ev(ast.parse(expr, mode='eval').body), 8)
+        except Exception:
+            return None
+
+    @staticmethod
     def _fsize(n):
         if n >= 2**30:
             return '{:.1f} Go'.format(n / 2**30)
@@ -1037,6 +1116,10 @@ class ContextuelApp(App):
             self._rg_ghpage(img, d)
         elif self.kind == 'hf':
             self._rg_hf(img, d)
+        elif self.kind == 'gsearch':
+            self._rg_gsearch(img, d)
+        elif self.kind == 'chat':
+            self._rg_chat(img, d)
         else:
             self._rg_default(img, d)
 
@@ -1063,6 +1146,8 @@ class ContextuelApp(App):
         return lines or [' ']
 
     def _rg_github(self, img, d):
+        if not self.repo:                    # course avec le thread watch
+            return self._rg_default(img, d)
         F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
@@ -1762,6 +1847,109 @@ class ContextuelApp(App):
             d.text((106, yy), r[:36], font=F_XS, fill=charte.FG, anchor='lm')
             yy += 17
         d.text((106, yy + 8), 'S3 = copier huggingface-cli download',
+               font=F_T, fill=(90, 95, 110), anchor='lm')
+
+    def _rg_gsearch(self, img, d):
+        """Recherche Google : requete + RESULTAT DE CALCUL local + outils."""
+        from urllib.parse import parse_qs as _pqs
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        u = urlsplit(self.pl or '')
+        q = (_pqs(u.query).get('q') or [''])[0]
+        tbm = (_pqs(u.query).get('tbm') or [''])[0]
+        res = self._calc(q)
+        caps = [
+            (charte.ico_copy, 'Requete', '', None, False),
+            (charte.ico_search, 'Lucky', '', None, False),
+            (charte.ico_window, 'Images', '', None, tbm == 'isch'),
+            (charte.ico_home, 'Actus', '', None, tbm == 'nws'),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'SEARCH', charte.BLUE)
+        # barre de recherche visuelle
+        d.rounded_rectangle((106, 14, 313, 58), radius=12, fill=charte.CARD,
+                            outline=charte.BORDER, width=2)
+        charte.ico_search(d, 124, 36, 8, charte.DIM)
+        import textwrap
+        qq = textwrap.wrap(q or '(vide)', 24)[:2] or [' ']
+        d.text((140, 28), qq[0], font=F_XS, fill=charte.FG, anchor='lm')
+        if len(qq) > 1:
+            d.text((140, 45), qq[1], font=F_XS, fill=charte.DIM, anchor='lm')
+        # resultat de calcul
+        if res is not None:
+            d.rounded_rectangle((106, 68, 313, 118), radius=10,
+                                fill=(14, 40, 24), outline=charte.GREEN)
+            d.text((106, 93), '=', font=fipui.font(26), fill=charte.GREEN,
+                   anchor='lm')
+            rs = ('{:g}'.format(res))
+            while rs and d.textlength(rs, font=fipui.font(26)) > 170:
+                rs = rs[:-1]
+            d.text((140, 93), rs, font=fipui.font(26), fill=(150, 255, 180),
+                   anchor='lm')
+        else:
+            d.text((210, 93), 'calcul ? tapez ex. 3*1.25', font=F_T,
+                   fill=(90, 95, 110), anchor='mm')
+        charte.ico_clock(d, 111, 134, 4, charte.DIM)
+        pos, tot = self._tab_pos()
+        meta = self._duree() + (
+            '   onglet {}/{}'.format(pos, tot) if pos else '')
+        d.text((120, 134), meta, font=F_T, fill=charte.DIM, anchor='lm')
+        d.text((106, 156), 'OUTILS', font=F_T, fill=charte.DIM, anchor='lm')
+        for i, ln in enumerate([
+                'S2 Lucky = premier resultat',
+                'S3 recherche d images',
+                'S4 recherche d actualites']):
+            d.text((106, 174 + i * 17), ln, font=F_XS, fill=charte.FG,
+                   anchor='lm')
+
+    def _rg_chat(self, img, d):
+        """Conversations IA (z.ai, ChatGPT, Claude...) : titre + raccourcis."""
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        tab = self.tab or {}
+        host = urlsplit(self.pl or '').netloc.replace('www.', '')
+        caps = [
+            (charte.ico_copy, 'Titre', '', None, False),
+            (charte.ico_link, 'URL', '', None, False),
+            (charte.ico_home, 'Accueil', '', None, False),
+            (charte.ico_search, 'Google', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'AI', charte.PURPLE)
+        d.rounded_rectangle((106, 12, 146, 52), radius=8, fill=(38, 20, 56),
+                            outline=charte.PURPLE)
+        charte.ico_star(d, 126, 32, 11, charte.PURPLE)
+        d.text((152, 24), host[:20], font=F_S, fill=charte.FG, anchor='lm')
+        d.text((152, 45), 'assistant IA', font=F_T, fill=charte.DIM,
+               anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        d.text((106, 76), 'CONVERSATION', font=F_T, fill=charte.DIM,
+               anchor='lm')
+        import textwrap
+        title = (tab.get('title') or host).replace(' - ' + host, '')
+        yy = 96
+        for ln in textwrap.wrap(title, 32)[:4]:
+            d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
+            yy += 17
+        d.line((106, yy - 6, 313, yy - 6), fill=charte.BORDER)
+        charte.ico_clock(d, 111, yy + 8, 4, charte.DIM)
+        pos, tot = self._tab_pos()
+        meta = self._duree() + (
+            '   onglet {}/{}'.format(pos, tot) if pos else '')
+        d.text((120, yy + 8), meta, font=F_T, fill=charte.DIM, anchor='lm')
+        d.text((106, yy + 26), 'S3 Accueil = nouvelle conversation',
                font=F_T, fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):

@@ -138,6 +138,20 @@ class FenetresApp(App):
             except Exception:
                 pass
             self.wins = wins
+            # onglets navigateurs via UIA (uiatabs.py, sans extension)
+            tabs = []
+            try:
+                import uiatabs
+                for e in uiatabs.snapshot():
+                    for t in e['tabs']:
+                        tabs.append({'kind': 'tab', 'title': t['title'],
+                                     'active': t['active'],
+                                     'url': e['url'] if t['active'] else '',
+                                     'hwnd': e['hwnd']})
+            except Exception:
+                pass
+            self.tabs = tabs
+            self.tabs_t = time.time() if tabs else 0.0
             self._stop.wait(POLL_S)
 
     # ---------- entrees unifiees ----------
@@ -156,35 +170,14 @@ class FenetresApp(App):
         self.cursor = max(0, min(self.cursor, len(ent) - 1))
         return ent[self.cursor]
 
-    # ---------- commandes extension (file du daemon, partagee) ----------
-
-    def _queue(self, cmd):
-        self.d.queue_tab_cmd(cmd)
+    # ---------- commandes ----------
 
     def http_post(self, payload):
-        tabs = payload.get('tabs')
-        if isinstance(tabs, list):
-            self.tabs = [{'kind': 'tab', 'id': t.get('id'),
-                          'windowId': t.get('windowId'),
-                          'title': t.get('title') or '',
-                          'url': t.get('url') or '',
-                          'active': bool(t.get('active')),
-                          'pinned': bool(t.get('pinned'))}
-                         for t in tabs if t.get('id') is not None]
-            self.tabs_t = time.time()
-        return {'ok': True, 'tabs': len(self.tabs)}
+        return {'ok': False, 'error': 'extension supprimee : onglets via UIA'}
 
     def http_get(self, q=None):
-        ext = -1
-        if q and 'cursor' in q:
-            try:
-                ext = int(q['cursor'][0])
-            except Exception:
-                ext = -1
-        gen = getattr(self.d, 'tab_gen', 0)
-        cmd = self.d.tab_cmd if (self.d.tab_cmd and ext < gen) else None
-        return {'cmd': cmd, 'cursor': gen,
-                'windows': len(self.wins), 'tabs': len(self.tabs)}
+        return {'windows': len(self.wins), 'tabs': len(self.tabs),
+                'uia': True}
 
     # ---------- boutons ----------
 
@@ -249,26 +242,26 @@ class FenetresApp(App):
             elif n == 6:
                 _clipboard_set(e['title'])
                 self.alert('titre copie')
-        else:                                             # onglet chrome
-            tid, wid = e['id'], e.get('windowId')
-            if n == 1:
-                self._queue({'action': 'activate', 'tabId': tid,
-                             'windowId': wid})
-                self.alert('onglet actif')
+        else:                                             # onglet navigateur
+            import webbrowser
+            if n == 1:                                    # activer (UIA)
+                import uiatabs
+                if uiatabs.select(e['hwnd'], e['title']):
+                    self.alert('onglet active')
+                else:
+                    self.alert('UIA: echec selection')
             elif n == 2:
-                self._queue({'action': 'close', 'tabId': tid})
+                _clipboard_set(e['title'])
+                self.alert('titre copie')
             elif n == 3:
-                self._queue({'action': 'reload', 'tabId': tid})
+                if e.get('url'):
+                    _clipboard_set(e['url'])
+                    self.alert('URL copiee')
+                else:
+                    self.alert('URL: onglet actif seulement')
             elif n == 4:
-                self._queue({'action': 'pin', 'tabId': tid})
-                self.alert('epingle ?')
-            elif n == 5:
-                if self._confirm('others'):
-                    self._queue({'action': 'close_others', 'tabId': tid,
-                                 'windowId': wid})
-            elif n == 6:
-                _clipboard_set(e.get('url') or '')
-                self.alert('URL copiee')
+                webbrowser.open('https://www.google.com/search?q=' +
+                                e['title'].replace(' ', '+'))
 
     # ---------- rendu ----------
 
@@ -295,20 +288,15 @@ class FenetresApp(App):
                 (charte.ico_copy, 'Titre', '', None, False),
             ]
         elif sel:
-            armed = self._armed and time.time() - self._armed[1] < 3.0 \
-                and self._armed[0]
             caps = [
                 (charte.ico_play, 'Activer', '', None, sel.get('active',
                                                                False)),
-                (charte.ico_x, 'Fermer', '', None, False),
-                (charte.ico_clock, 'Recharger', '', None, False),
-                (charte.ico_pin, 'Epingler', 'ON' if sel.get('pinned')
-                 else '', charte.BLUE if sel.get('pinned') else None,
-                 sel.get('pinned', False)),
-                (charte.ico_x, 'Autres-', '2x',
-                 charte.ORANGE if armed == 'others' else None,
-                 armed == 'others'),
-                (charte.ico_copy, 'URL', '', None, False),
+                (charte.ico_copy, 'Titre', '', None, False),
+                (charte.ico_link, 'URL', '' if sel.get('url') else 'n/a',
+                 None, False),
+                (charte.ico_home, 'Google', '', None, False),
+                (charte.ico_min, 'Vol-', '', None, False),
+                (charte.ico_min, 'Vol+', '', None, False),
             ]
         else:
             caps = [(None, '-', '', None, False)] * 6

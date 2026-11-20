@@ -222,23 +222,18 @@ class ContextuelApp(App):
     # ---------- classification du contexte (fenetre/onglet actif) ----------
 
     def _fg_tab(self):
-        """Onglet ACTIF de la fenetre navigateur au premier plan (extension),
-        ou None. La fenetre Chrome a pour titre '<onglet actif> - Navigateur'."""
-        if self.proc not in ('chrome.exe', 'msedge.exe'):
+        """Onglet actif de la fenetre navigateur au premier plan, via UIA
+        (uiatabs.py — sans extension) : {'title','url','hwnd'} ou None."""
+        if self.proc not in ('chrome.exe', 'msedge.exe') or not self.hwnd:
             return None
-        tabs = getattr(self.d, 'chrome_tabs', None) or []
-        if time.time() - getattr(self.d, 'chrome_tabs_t', 0) > 12:
-            return None
-        act = [t for t in tabs if t.get('active')]
-        if not act:
-            return None
-        wt = (self.wtitle or '').lower()
-        for t in sorted(act, key=lambda t: len(t.get('title') or ''),
-                        reverse=True):
-            tt = (t.get('title') or '')[:30].lower()
-            if tt and wt.startswith(tt[:18]):
-                return t
-        return act[0] if len(act) == 1 else None
+        import uiatabs
+        try:
+            tab = uiatabs.fg_tab(self.hwnd)
+        except Exception:
+            tab = None
+        if tab and tab.get('url'):
+            return tab
+        return None
 
     def _classify(self, title):
         """-> (kind, payload, tab) : github+repo | youtube+url | site+url |
@@ -364,14 +359,13 @@ class ContextuelApp(App):
             return
         n = int(name[1])
         tab = self.tab or {}
-        tid = tab.get('id')
         if self.kind == 'youtube' and self.pl:
+            import keysend
             e = self.yt.get(self.pl) or {}
             data = e.get('data') or {}
             title = (data.get('title')
                      or tab.get('title', '').replace(' - YouTube', ''))
             if n == 1:
-                import keysend
                 keysend.tap('playpause')
             elif n == 2:
                 clipboard_set(self.pl)
@@ -382,13 +376,12 @@ class ContextuelApp(App):
             elif n == 4:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (title or '').replace(' ', '+'))
-            elif n == 5 and tid is not None:
-                self.d.queue_tab_cmd({'action': 'close', 'tabId': tid})
-                self.alert('fermeture')
-            elif n == 6 and tid is not None:
-                self.d.queue_tab_cmd({'action': 'reload', 'tabId': tid})
-                self.alert('rechargement')
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
         elif self.kind == 'site' and self.pl:
+            import keysend
             if n == 1:
                 clipboard_set(self.pl)
                 self.alert('URL copiee')
@@ -399,15 +392,13 @@ class ContextuelApp(App):
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (tab.get('title') or self.pl)
                                 .replace(' ', '+'))
-            elif n == 4 and tid is not None:
-                self.d.queue_tab_cmd({'action': 'pin', 'tabId': tid})
-                self.alert('epingle ?')
-            elif n == 5 and tid is not None:
-                self.d.queue_tab_cmd({'action': 'close', 'tabId': tid})
-                self.alert('fermeture')
-            elif n == 6 and tid is not None:
-                self.d.queue_tab_cmd({'action': 'reload', 'tabId': tid})
-                self.alert('rechargement')
+            elif n == 4:
+                clipboard_set(urlsplit(self.pl).netloc)
+                self.alert('domaine copie')
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
         elif self.repo:
             base = f'https://github.com/{self.repo}'
             if n == 1:
@@ -498,6 +489,7 @@ class ContextuelApp(App):
     def http_get(self):
         c = self.cache.get(self.repo) if self.repo else None
         return {'process': self.proc, 'title': self.wtitle[:100],
+                'kind': self.kind, 'payload': (self.pl or '')[:120],
                 'repo': self.repo, 'pending': self.pending,
                 'stars': c['data'].get('stargazers_count') if c else None,
                 'issues': c['data'].get('open_issues_count') if c else None,
@@ -674,8 +666,8 @@ class ContextuelApp(App):
             (charte.ico_link, 'URL', '', None, False),
             (charte.ico_copy, 'Titre', '', None, False),
             (charte.ico_home, 'Google', '', None, False),
-            (charte.ico_x, 'Fermer', '', None, False),
-            (charte.ico_clock, 'Refresh', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
         ]
         for i, (ic, lab, val, col, hot) in enumerate(caps):
             charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
@@ -717,11 +709,9 @@ class ContextuelApp(App):
             (charte.ico_link, 'URL', '', None, False),
             (charte.ico_copy, 'Titre', '', None, False),
             (charte.ico_home, 'Google', '', None, False),
-            (charte.ico_pin, 'Epingler', 'ON' if tab.get('pinned') else '',
-             charte.BLUE if tab.get('pinned') else None,
-             bool(tab.get('pinned'))),
-            (charte.ico_x, 'Fermer', '', None, False),
-            (charte.ico_clock, 'Refresh', '', None, False),
+            (charte.ico_copy, 'Domaine', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
         ]
         for i, (ic, lab, val, col, hot) in enumerate(caps):
             charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,

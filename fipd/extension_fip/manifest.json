@@ -1,9 +1,0 @@
-{
-  "manifest_version": 3,
-  "name": "FIP onglets",
-  "version": "1.0",
-  "description": "Envoie les onglets ouverts au daemon FIP (127.0.0.1:8199) et execute ses commandes",
-  "permissions": ["tabs"],
-  "host_permissions": ["http://127.0.0.1:8199/*"],
-  "background": { "service_worker": "background.js" }
-}

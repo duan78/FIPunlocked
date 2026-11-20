@@ -704,7 +704,10 @@ class ContextuelApp(App):
         self.d._redraw_now()
 
     def _fetch_ediseo(self):
-        """EdiSEO : lit le pipeline complet sur l'ecran (UIA)."""
+        """EdiSEO : lit le pipeline complet sur l'ecran (UIA).
+        Les nombres sont des TEXTES SEPARES ('33\u202f065' puis 'URLs
+        importées') — on scanne sequentiellement : chaque nombre precise
+        est memorise, puis apparie au label suivant."""
         import uiatabs
 
         def read_page():
@@ -734,51 +737,100 @@ class ContextuelApp(App):
                 walk(c, 0)
             return texts
 
+        def to_num(s):
+            v = s.strip().replace('\u202f', '').replace('\xa0', '') \
+                .replace(' ', '')
+            if re.fullmatch(r'[\d.,]+', v):
+                try:
+                    return float(v.replace(',', '.'))
+                except ValueError:
+                    pass
+            return None
+
         m = {}
         try:
             texts = uiatabs.run_in_uia_thread(read_page) or []
-            blob = ' | '.join(texts)
 
-            def grab_num(pattern):
-                r = re.search(pattern, blob)
-                if r:
-                    v = r.group(1).replace('\u202f', '').replace('\xa0', '') \
-                        .replace(' ', '').replace(',', '.')
-                    try:
-                        return float(v)
-                    except ValueError:
-                        return v
-                return None
-
-            # pipeline
-            m['importees'] = grab_num(r'(\d[\d\s\u202f\u00a0]*)\s*URLs?\s*import')
-            m['production'] = grab_num(
-                r'(\d[\d\s\u202f\u00a0]*)\s*En production')
-            m['generes'] = grab_num(
-                r'(\d[\d\s\u202f\u00a0]*)\s*Générés')
-            m['livrables'] = grab_num(
-                r'(\d[\d\s\u202f\u00a0]*)\s*livrables')
-            # génération LLM
-            m['gen_cours'] = grab_num(
-                r'Génération LLM.*?(\d+)\s*EN COURS')
-            m['gen_file'] = grab_num(
-                r'Génération LLM.*?(\d+)\s*EN FILE')
-            m['gen_err'] = grab_num(
-                r'Génération LLM.*?(\d+)\s*ERREURS')
-            r = re.search(r'Génération LLM.*?ETA\s*([^|]+?)(?:\s*\||$)',
-                          blob)
-            m['gen_eta'] = r.group(1).strip()[:20] if r else '—'
-            # juge
-            m['juge_cours'] = grab_num(r'Juge LLM.*?(\d+)\s*EN COURS')
-            m['juge_file'] = grab_num(r'Juge LLM.*?(\d+)\s*EN FILE')
-            r = re.search(r'Juge LLM.*?ETA\s*([^|]+?)(?:\s*\||$)', blob)
-            m['juge_eta'] = r.group(1).strip()[:20] if r else '—'
-            # crédits
-            m['serper'] = grab_num(r'(\d[\d\s\u202f\u00a0]*)\s*Crédits')
-            m['serper_max'] = grab_num(r'plafond\s*(\d[\d\s\u202f\u00a0]*)')
-            # dernière activité
-            r = re.search(r'Texte généré\s*(\d{2}:\d{2}:\d{2})', blob)
-            m['last_gen'] = r.group(1) if r else ''
+            # scanner sequentiel : nombre -> label
+            last_num = None
+            pipeline = {}
+            pool_gen = {}
+            pool_jug = {}
+            in_gen_zone = False
+            in_jug_zone = False
+            for t in texts:
+                v = to_num(t)
+                if v is not None:
+                    last_num = v
+                    continue
+                tl = t.strip().lower()
+                # pipeline (entonnoir)
+                if tl == 'importées':
+                    pipeline['importees'] = last_num
+                elif tl == 'en production':
+                    pipeline['production'] = last_num
+                elif tl == 'générés':
+                    pipeline['generes'] = last_num
+                elif tl == 'livrables' and last_num and last_num > 1000:
+                    pipeline['livrables'] = last_num
+                # zones pools
+                if 'génération llm' in tl:
+                    in_gen_zone, in_jug_zone = True, False
+                elif 'juge llm' in tl:
+                    in_gen_zone, in_jug_zone = False, True
+                elif tl.startswith('①') or tl.startswith('②'):
+                    in_gen_zone = in_jug_zone = False
+                if in_gen_zone:
+                    if tl == 'en cours':
+                        pool_gen['cours'] = last_num
+                    elif tl == 'en file':
+                        pool_gen['file'] = last_num
+                    elif tl == 'eta' and last_num is None:
+                        pass          # ETA = texte suivant, pas nombre
+                if in_jug_zone:
+                    if tl == 'en cours':
+                        pool_jug['cours'] = last_num
+                    elif tl == 'en file':
+                        pool_jug['file'] = last_num
+                # credits
+                if tl == 'crédits serper':
+                    m['serper'] = last_num
+                elif tl == 'plafond' and m.get('serper'):
+                    pass              # plafond = nombre APRES (geré après)
+            # plafond : chercher le nombre APRES 'plafond'
+            for i, t in enumerate(texts):
+                if t.strip().lower() == 'plafond':
+                    for j in range(i + 1, min(i + 3, len(texts))):
+                        v = to_num(texts[j])
+                        if v is not None:
+                            m['serper_max'] = v
+                            break
+                    break
+            # ETA : chercher 'ETA' exact puis le texte suivant
+            def find_eta(zone_texts):
+                for i, t in enumerate(zone_texts):
+                    if t.strip() == 'ETA':
+                        for j in range(i + 1, min(i + 3,
+                                                  len(zone_texts))):
+                            v = zone_texts[j].strip()
+                            if v and len(v) < 25 and v != '?':
+                                return v
+                return '—'
+            gen_start = next((i for i, t in enumerate(texts)
+                              if 'génération llm' in t.lower()), 0)
+            jug_start = next((i for i, t in enumerate(texts)
+                              if 'juge llm' in t.lower()), gen_start)
+            m['gen_eta'] = find_eta(texts[gen_start:gen_start + 40])
+            m['juge_eta'] = find_eta(texts[jug_start:jug_start + 40])
+            # derniere activite
+            for t in texts:
+                if re.match(r'^\d{2}:\d{2}:\d{2}$', t.strip()):
+                    m['last_gen'] = t.strip()
+            m.update(pipeline)
+            m['gen_cours'] = pool_gen.get('cours')
+            m['gen_file'] = pool_gen.get('file')
+            m['juge_cours'] = pool_jug.get('cours')
+            m['juge_file'] = pool_jug.get('file')
         except Exception as e:
             print('[ediseo]', str(e)[:50], flush=True)
         self.ediseo = {'t': time.time(), 'm': m}
@@ -1474,6 +1526,7 @@ class ContextuelApp(App):
                 'kind': self.kind, 'payload': repr(self.pl)[:120],
                 'ans': ans,
                 'gsc': (self.gsc or {}).get('m'),
+                'ediseo': (self.ediseo or {}).get('m'),
                 'repo': self.repo, 'pending': self.pending,
                 'stars': c['data'].get('stargazers_count') if c else None,
                 'issues': c['data'].get('open_issues_count') if c else None,

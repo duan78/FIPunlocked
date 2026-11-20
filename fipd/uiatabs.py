@@ -84,7 +84,10 @@ def _scan():
                     break
                 try:
                     v = edit.GetValuePattern().Value
-                    if v and (v.startswith('http') or '.' in v):
+                    if v and (v.startswith('http')
+                              or ('.' in v and ' ' not in v)):
+                        if not v.startswith('http'):
+                            v = 'https://' + v   # UIA rend l'URL sans schema
                         entry['url'] = v
                         break
                 except Exception:

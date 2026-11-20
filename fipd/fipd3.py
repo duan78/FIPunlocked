@@ -1167,7 +1167,10 @@ class H(BaseHTTPRequestHandler):
                                  for i, a in enumerate(D.apps)],
                         'page': D.page, 'mode': D.mode})
         elif self.path.startswith('/app/'):
-            name = self.path[len('/app/'):].strip('/')
+            import inspect
+            from urllib.parse import urlsplit, parse_qs
+            u = urlsplit(self.path)
+            name = u.path[len('/app/'):].strip('/')
             app = next((a for a in D.apps if a.name == name), None)
             if app is None:
                 return self._json({'error': f'app inconnue: {name}'}, 404)
@@ -1175,6 +1178,8 @@ class H(BaseHTTPRequestHandler):
             if h is None:
                 return self._json({'error': f'{name} n expose pas http_get'}, 405)
             try:
+                if len(inspect.signature(h).parameters) >= 2:
+                    return self._json(h(parse_qs(u.query)))
                 return self._json(h())
             except Exception as e:
                 return self._json({'error': str(e)}, 500)

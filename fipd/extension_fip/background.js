@@ -30,6 +30,7 @@ async function poll() {
       try {
         if (c.action === 'activate') {
           chrome.tabs.update(c.tabId, { active: true });
+          if (c.windowId) chrome.windows.update(c.windowId, { focused: true });
         } else if (c.action === 'close') {
           chrome.tabs.remove(c.tabId);
         } else if (c.action === 'reload') {

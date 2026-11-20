@@ -24,9 +24,17 @@ controller** for anything: system dashboard, news reader, custom pages, or plain
   two extra LEDs, all individually controllable
 - 🧩 **FIP-native apps** (`fipui.py`) — each page is an app combining rendering,
   button/knob events, persistent LEDs and visual alerts
+- 📂 **Hot-loaded apps** — drop a `fipui.App` in `fipd/apps/`, it becomes a page
+  at startup or via `POST /apps/reload` (no daemon restart)
+- 🎨 **Shared design system** (`charte.py`) — GitHub-Dark palette, rounded
+  cards, button keycaps aligned with the physical buttons, vector icons
+- 🔖 **Contextual page (CONTEXTE)** — the panel adapts to the **active window**:
+  a GitHub repo tab becomes a live repo card (stars/issues/PRs/runs + owner
+  avatar, via `gh`) with one-press actions; any other window gets window
+  actions (always-on-top, kill, restart, copy exe path…)
 - 🎮 **REFLEX mini-game** — whack-a-mole across the 6 rows with LED mirroring,
   speed bonus, lives, level control on both knobs
-- 📑 **5 built-in pages** (left knob cycles) — see below
+- 📑 **14 pages** (7 built-in + 7 apps) — left knob cycles, see below
 - ⌨️ **Opt-in keyboard bindings** — map `ctrl+shift+s`, `volumemute`, `win+d`…
   on any control. *Default: controls act only on the FIP's own pages, nothing
   runs on the host.*
@@ -47,7 +55,8 @@ python fipd3.py                            # -> http://127.0.0.1:8199
 
 ## 📑 The seven built-in pages
 
-![FIP pages](docs/pages.png)
+![FIP pages](docs/pages.png) *(core pages — the `apps/` directory adds 7 more,
+hot-loaded)*
 
 | Page | Content |
 |---|---|

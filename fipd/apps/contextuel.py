@@ -152,6 +152,7 @@ class ContextuelApp(App):
         self.tab = None                # onglet actif (UIA)
         self.kind = 'app'              # github | youtube | site | app
         self.pl = None                 # payload du contexte (repo/url)
+        self.gh_blob = None            # (branche, chemin) si vue fichier GH
         self.tab_since = 0.0           # debut du contexte courant (duree)
         self.yt = {}                   # url youtube -> {'data', 'img'}
         self.fav = {}                  # host -> favicon PIL (ou None)
@@ -329,6 +330,9 @@ class ContextuelApp(App):
                         'orgs', 'users', 'settings', 'marketplace',
                         'topics', 'features', 'explore', 'notifications',
                         'pulls', 'search', 'new', 'codespaces'):
+                    mb = re.match(r'^/' + m.group(1) + '/' + m.group(2) +
+                                  r'/blob/([\w.-]+)/(.+)$', path)
+                    self.gh_blob = (mb.group(1), mb.group(2)) if mb else None
                     return 'github', f'{m.group(1)}/{m.group(2)}', tab
             yt = (('youtube.com' in host and
                    (path == '/watch' or host.startswith('music.')))
@@ -641,6 +645,62 @@ class ContextuelApp(App):
             self._busy.release()
             self.d._redraw_now()
 
+    # ---------- familles d'onglets (navigation croisee) ----------
+    # NB : les onglets inactifs n'exposent pas leur URL — detection par
+    # TITRE. Les titres GitHub n'ont plus de suffixe '· GitHub' : on matche
+    # le motif 'owner/repo' nu + 'Pull Request'/'Issue #'.
+
+    FAMILIES = ('github', 'ghpage', 'youtube', 'gmail', 'wiki', 'hf')
+
+    def _fam_match(self, tl):
+        k = self.kind
+        if k in ('github', 'ghpage'):
+            return bool(re.match(r'^[\w.-]+/[\w.-]+$', tl)) \
+                or 'pull request' in tl or 'issue #' in tl
+        hints = {
+            'youtube': ('youtube',),
+            'gmail': ('gmail', 'messagerie', 'boîte de réception'),
+            'wiki': ('wikipédia', 'wikipedia'),
+            'hf': ('hugging face',),
+        }.get(k, ())
+        return any(h in tl for h in hints)
+
+    def _family_tabs(self):
+        """[(hwnd, titre)] des onglets de la meme famille que le contexte."""
+        if self.kind not in self.FAMILIES:
+            return []
+        out = []
+        try:
+            import uiatabs
+            for e in uiatabs.snapshot():
+                for t in e['tabs']:
+                    if (t['title'] or '').strip() and \
+                            self._fam_match(t['title'].lower()):
+                        out.append((e['hwnd'], t['title']))
+        except Exception:
+            pass
+        return out
+
+    def _cycle_tab(self, direction):
+        """Molette droite : onglet suivant/precedent de la meme famille."""
+        fam = self._family_tabs()
+        if len(fam) < 2:
+            self.alert('1 seul onglet')
+            return
+        cur = (self.tab or {}).get('title') or self.wtitle
+        titles = [t for _, t in fam]
+        try:
+            i = titles.index(cur)
+        except ValueError:
+            i = 0
+        nh, nt = fam[(i + direction) % len(fam)]
+        import uiatabs
+        u32.SetForegroundWindow(nh)
+        if uiatabs.select(nh, nt):
+            self.alert('⇄ ' + nt[:24])
+        else:
+            self.alert('selection impossible')
+
     # ---------- boutons ----------
 
     def on_event(self, name, pressed):
@@ -648,10 +708,16 @@ class ContextuelApp(App):
             return
         import webbrowser
         if name == 'right_cw':
-            self.scroll += 1
+            if self.kind in ('wiki', 'app'):   # ces fiches utilisent le defilement
+                self.scroll += 1
+            else:
+                self._cycle_tab(+1)
             return
         if name == 'right_ccw':
-            self.scroll = max(0, self.scroll - 1)
+            if self.kind in ('wiki', 'app'):
+                self.scroll = max(0, self.scroll - 1)
+            else:
+                self._cycle_tab(-1)
             return
         if name not in ('S1', 'S2', 'S3', 'S4', 'S5', 'S6'):
             return
@@ -820,19 +886,23 @@ class ContextuelApp(App):
                 keysend.tap('volumeup')
         elif self.kind == 'site' and self.pl:
             import keysend
+            host = urlsplit(self.pl).netloc
             if n == 1:
                 clipboard_set(self.pl)
                 self.alert('URL copiee')
             elif n == 2:
                 clipboard_set(tab.get('title') or '')
                 self.alert('titre copie')
-            elif n == 3:
-                webbrowser.open('https://www.google.com/search?q=' +
-                                (tab.get('title') or self.pl)
-                                .replace(' ', '+'))
-            elif n == 4:
-                clipboard_set(urlsplit(self.pl).netloc)
-                self.alert('domaine copie')
+            elif n == 3:                    # recherche dans le site
+                webbrowser.open('https://www.google.com/search?q='
+                                'site:' + host + ' ' +
+                                (tab.get('title') or '').replace(' ', '+'))
+                self.alert('dans ' + host)
+            elif n == 4:                    # traduire la page
+                webbrowser.open('https://translate.google.com/translate'
+                                '?sl=auto&tl=en&u=' +
+                                self.pl.replace(':', '%3A').replace('/', '%2F'))
+                self.alert('traduction')
             elif n == 5:
                 keysend.tap('volumedown')
             elif n == 6:
@@ -918,8 +988,12 @@ class ContextuelApp(App):
             else:                               # --- dossier / multi
                 fpath = sel[0] if sel else path
                 if n == 1:
-                    clipboard_set(fpath)
-                    self.alert('chemin copie')
+                    if len(sel) > 1:            # copier toute la selection
+                        clipboard_set('\n'.join(sel))
+                        self.alert('{} chemins copies'.format(len(sel)))
+                    else:
+                        clipboard_set(fpath)
+                        self.alert('chemin copie')
                 elif n == 2:
                     try:
                         subprocess.Popen(['wt', '-d', path])
@@ -1030,8 +1104,14 @@ class ContextuelApp(App):
             elif n == 4:
                 webbrowser.open(base)
             elif n == 5:
-                clipboard_set(base)
-                self.alert('URL copiee')
+                if self.gh_blob:               # vue fichier : URL raw
+                    clipboard_set(
+                        'https://raw.githubusercontent.com/{}/{}/{}'.format(
+                            self.repo, self.gh_blob[0], self.gh_blob[1]))
+                    self.alert('URL raw copiee')
+                else:
+                    clipboard_set(base)
+                    self.alert('URL copiee')
             elif n == 6:
                 clipboard_set(f'gh repo clone {self.repo}')
                 self.alert('cmd clone copiee')
@@ -1282,6 +1362,17 @@ class ContextuelApp(App):
             self._rg_wiki(img, d)
         else:
             self._rg_default(img, d)
+        # badge famille : les onglets du meme site se cyclent a la molette
+        if self.kind in self.FAMILIES and self.kind != 'wiki':
+            try:
+                fam_n = len(self._family_tabs())
+            except Exception:
+                fam_n = 0
+            if fam_n > 1:
+                d.rounded_rectangle((226, 222, 313, 235), radius=6,
+                                    fill=charte.CARD, outline=charte.BLUE)
+                d.text((234, 228), '{} onglets · molette'.format(fam_n),
+                       font=fipui.font(11), fill=charte.BLUE, anchor='lm')
 
     def _chip(self, d, x1, y, text, col):
         f = fipui.font(12)
@@ -1352,9 +1443,18 @@ class ContextuelApp(App):
             d.text((166, 43), lang, font=F_XS, fill=charte.DIM, anchor='lm')
         d.text((106, 64), 'branche ' + data.get('default_branch', '?'),
                font=F_XS, fill=charte.DIM, anchor='lm')
-        charte.ico_clock(d, 111, 82, 4, charte.DIM)
-        d.text((120, 82), 'push ' + (charte.ago(data.get('pushed_at')) or '?'),
-               font=F_XS, fill=charte.DIM, anchor='lm')
+        if self.gh_blob:                    # vue fichier : chemin remplace push
+            charte.ico_code(d, 115, 82, 4, (120, 160, 230))
+            bp = self.gh_blob[1]
+            while bp and d.textlength(bp, font=F_XS) > 180:
+                bp = bp[:-1]
+            d.text((124, 82), bp, font=F_XS, fill=(120, 160, 230),
+                   anchor='lm')
+        else:
+            charte.ico_clock(d, 111, 82, 4, charte.DIM)
+            d.text((120, 82),
+                   'push ' + (charte.ago(data.get('pushed_at')) or '?'),
+                   font=F_XS, fill=charte.DIM, anchor='lm')
         # stats en pills
         x = 106
         x += charte.pill(d, x, 106, charte.ico_star, str(
@@ -1472,8 +1572,8 @@ class ContextuelApp(App):
         caps = [
             (charte.ico_link, 'URL', '', None, False),
             (charte.ico_copy, 'Titre', '', None, False),
-            (charte.ico_copy, 'Domaine', '', None, False),
-            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_search, 'Site', '', None, False),
+            (charte.ico_home, 'Traduire', '', None, False),
             (charte.ico_min, 'Vol-', '', None, False),
             (charte.ico_min, 'Vol+', '', None, False),
         ]

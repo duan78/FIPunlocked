@@ -79,8 +79,12 @@ pour exposer `/app/<name>`) :
   stats, runs, PR, description ; S1-S6 = Issues/PRs/Actions/Repo/URL/Clone)
   ; **onglet YouTube** → miniature + titre + chaîne (oEmbed, Lecture/Pause,
   copies, Google, volume) ; **onglet web** → favicon + domaine + titre +
-  URL (copies, Google, domaine, volume) ; **app Windows** → avatar lettre +
-  PID + titre (Copier titre/Toujours devant/Minimiser/Tuer 2×/Redémarrer 2×/
+  URL (copies, Google, domaine, volume) ; **app Windows** → fiches par
+  application : **Explorateur** (chemin réel via COM Shell.Application,
+  nb d'éléments, espace libre ; copier chemin / chemin unix / terminal ici
+  `wt -d` / parent Navigate2 / actualiser), **VS Code** (fichier + workspace),
+  **Terminal** (cwd du titre), **VLC** (média, pause/stop/muet) ; sinon fiche
+  générique (Copier titre/Toujours devant/Minimiser/Tuer 2×/Redémarrer 2×/
   Chemin exe). Onglets et URL via **UIA** (`uiatabs.py`), repli GitHub par
   titre sans UIA. `GET /app/contexte` = contexte courant. Rendu **charte
   graphique** (`charte.py` : palette GitHub Dark, `panel`/`keycap`/`pill`/

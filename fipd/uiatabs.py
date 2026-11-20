@@ -20,7 +20,7 @@ u32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM),
 u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
 
 BROWSERS = ('chrome.exe', 'msedge.exe')
-REFRESH_S = 1.2            # un scan complet ne prend que ~0,2 s
+REFRESH_S = 1.0            # un scan complet ne prend que ~0,2 s
 URL_STICKY_S = 15.0        # garder la derniere URL connue si lecture rate
 BROWSER_SUFFIXES = (' - Google Chrome', ' - Microsoft\xad Edge', ' - Mozilla Firefox',
                     ' - Brave', ' - Opera', ' - Vivaldi')

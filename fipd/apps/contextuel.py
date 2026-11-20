@@ -31,7 +31,7 @@ import fipui
 from fipui import App
 
 CREATE_NO_WINDOW = 0x08000000
-POLL_S = 1.2
+POLL_S = 1.0
 TTL_S = 45.0
 AV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'avatars')
 
@@ -159,6 +159,7 @@ class ContextuelApp(App):
         self.hfd = {}                  # modele HF -> {'t', 'data'}
         self.ddg = {}                  # requete -> {'t', 'data', 'img'}
         self.wiki = {}                 # (lang, titre) -> {'t', 'data', 'img'}
+        self._inflight = set()         # cles de fetch en cours (sans blocage)
         self._busy2 = threading.Lock()     # serialise les fetchs detailles
         self.exp_sel = []              # fichiers selectionnes (explorer)
         self._exp = {'t': 0.0, 'map': {}}   # hwnd -> (chemin, obj, sel)
@@ -225,16 +226,20 @@ class ContextuelApp(App):
             if kind == 'gsearch' and pl:
                 from urllib.parse import parse_qs as _pq
                 q = (_pq(urlsplit(pl).query).get('q') or [''])[0]
-                if q and (q not in self.ddg
-                          or time.time() - self.ddg[q]['t'] > 120) and \
-                        self._busy2.acquire(blocking=False):
+                fk = 'ddg:' + q
+                if q and fk not in self._inflight and (
+                        q not in self.ddg
+                        or time.time() - self.ddg[q]['t'] > 120):
+                    self._inflight.add(fk)
                     threading.Thread(target=self._fetch_ddg, args=(q,),
                                      daemon=True).start()
             if kind == 'wiki' and isinstance(pl, dict):
                 key = (pl['lang'], pl['title'])
-                if (key not in self.wiki
-                        or time.time() - self.wiki[key]['t'] > 300) and \
-                        self._busy2.acquire(blocking=False):
+                fk = 'wiki:{}:{}'.format(*key)
+                if fk not in self._inflight and (
+                        key not in self.wiki
+                        or time.time() - self.wiki[key]['t'] > 300):
+                    self._inflight.add(fk)
                     threading.Thread(target=self._fetch_wiki, args=(dict(pl),),
                                      daemon=True).start()
             if kind == 'explorer':
@@ -522,25 +527,60 @@ class ContextuelApp(App):
         return None
 
     def _fetch_ddg(self, q):
-        """Reponse instantanee DuckDuckGo pour une recherche (sans cle)."""
+        """Reponse instantanee : DuckDuckGo (Answer/Abstract) puis, a defaut,
+        le meilleur article Wikipedia pour la requete (recherche + resume)."""
+        fk = 'ddg:' + q
+        data = {}
         try:
             import requests
-            r = requests.get('https://api.duckduckgo.com/',
-                             params={'q': q, 'format': 'json', 'no_html': 1,
-                                     'skip_disambig': 1}, timeout=7)
-            data = r.json() if r.status_code == 200 else None
-            img = self._dl_img((data or {}).get('Image'),
-                               https_prefix=True) if data else None
+            try:
+                r = requests.get('https://api.duckduckgo.com/',
+                                 params={'q': q, 'format': 'json',
+                                         'no_html': 1, 'skip_disambig': 1},
+                                 timeout=5)
+                data = r.json() if r.status_code == 200 else {}
+            except Exception:
+                data = {}
+            data = data or {}
+            if not (data.get('AbstractText') or data.get('Answer')):
+                try:                      # repli Wikipedia (UA obligatoire)
+                    from urllib.parse import quote
+                    s = requests.get(
+                        'https://fr.wikipedia.org/w/api.php',
+                        params={'action': 'query', 'list': 'search',
+                                'srsearch': q, 'srlimit': 1,
+                                'format': 'json'},
+                        headers={'User-Agent': 'fipd-contexte/1.0'},
+                        timeout=5)
+                    hits = s.json().get('query', {}).get('search') or []
+                    if hits:
+                        wq = requests.get(
+                            'https://fr.wikipedia.org/api/rest_v1/page/'
+                            'summary/' + quote(hits[0]['title']),
+                            headers={'User-Agent': 'fipd-contexte/1.0'},
+                            timeout=5)
+                        if wq.status_code == 200:
+                            wd = wq.json()
+                            data = {'Answer': data.get('Answer') or '',
+                                    'Heading': wd.get('title'),
+                                    'AbstractText': wd.get('extract'),
+                                    'AbstractURL': hits[0]['title'],
+                                    'Image': (wd.get('thumbnail') or {})
+                                    .get('source')}
+                except Exception:
+                    pass
+            img = self._dl_img(data.get('Image'), https_prefix=True)
             self.ddg[q] = {'t': time.time(), 'data': data, 'img': img}
         except Exception:
             self.ddg[q] = {'t': time.time(), 'data': None, 'img': None}
         finally:
-            self._busy2.release()
+            self._inflight.discard(fk)
             self.d._redraw_now()
 
     def _fetch_wiki(self, pl):
         """Resume d'article Wikipedia via l'API REST officielle."""
         key = (pl['lang'], pl['title'])
+        fk = 'wiki:{}:{}'.format(*key)
         try:
             import requests
             from urllib.parse import quote
@@ -556,7 +596,7 @@ class ContextuelApp(App):
             self.wiki[key] = {'t': time.time(), 'data': None, 'img': None,
                               'err': str(e)[:60]}
         finally:
-            self._busy2.release()
+            self._inflight.discard(fk)
             self.d._redraw_now()
 
     # ---------- recuperation des donnees GitHub (thread fetcher) ----------
@@ -1068,8 +1108,19 @@ class ContextuelApp(App):
 
     def http_get(self):
         c = self.cache.get(self.repo) if self.repo else None
+        ans = None
+        if self.kind == 'gsearch':
+            from urllib.parse import parse_qs as _pq
+            q = (_pq(urlsplit(self.pl or '').query).get('q') or [''])[0]
+            dd = self.ddg.get(q)
+            if dd and dd.get('data'):
+                ans = {'answer': (dd['data'].get('Answer') or '')[:40],
+                       'heading': (dd['data'].get('Heading') or '')[:40],
+                       'abstract': len(dd['data'].get('AbstractText') or ''),
+                       'img': dd.get('img') is not None}
         return {'process': self.proc, 'title': self.wtitle[:100],
                 'kind': self.kind, 'payload': repr(self.pl)[:120],
+                'ans': ans,
                 'repo': self.repo, 'pending': self.pending,
                 'stars': c['data'].get('stargazers_count') if c else None,
                 'issues': c['data'].get('open_issues_count') if c else None,

@@ -157,6 +157,8 @@ class ContextuelApp(App):
         self.fav = {}                  # host -> favicon PIL (ou None)
         self.ghd = {}                  # (repo, kind, n) -> {'t', 'data'}
         self.hfd = {}                  # modele HF -> {'t', 'data'}
+        self.ddg = {}                  # requete -> {'t', 'data', 'img'}
+        self.wiki = {}                 # (lang, titre) -> {'t', 'data', 'img'}
         self._busy2 = threading.Lock()     # serialise les fetchs detailles
         self.exp_sel = []              # fichiers selectionnes (explorer)
         self._exp = {'t': 0.0, 'map': {}}   # hwnd -> (chemin, obj, sel)
@@ -220,6 +222,21 @@ class ContextuelApp(App):
                         self._busy2.acquire(blocking=False):
                     threading.Thread(target=self._fetch_hf, args=(pl,),
                                      daemon=True).start()
+            if kind == 'gsearch' and pl:
+                from urllib.parse import parse_qs as _pq
+                q = (_pq(urlsplit(pl).query).get('q') or [''])[0]
+                if q and (q not in self.ddg
+                          or time.time() - self.ddg[q]['t'] > 120) and \
+                        self._busy2.acquire(blocking=False):
+                    threading.Thread(target=self._fetch_ddg, args=(q,),
+                                     daemon=True).start()
+            if kind == 'wiki' and isinstance(pl, dict):
+                key = (pl['lang'], pl['title'])
+                if (key not in self.wiki
+                        or time.time() - self.wiki[key]['t'] > 300) and \
+                        self._busy2.acquire(blocking=False):
+                    threading.Thread(target=self._fetch_wiki, args=(dict(pl),),
+                                     daemon=True).start()
             if kind == 'explorer':
                 self.exp_sel = self._explorer_sel()
             changed = (repo, kind, pl, proc, title[:60]) != last
@@ -280,6 +297,12 @@ class ContextuelApp(App):
                         'chat.openai.com', 'claude.ai', 'poe.com',
                         'lechat.mistral.ai'):
                 return 'chat', url, tab
+            if host.endswith('.wikipedia.org') and path.startswith('/wiki/'):
+                from urllib.parse import unquote as _uq
+                title = _uq(path[6:].split('#')[0]).replace('_', ' ')
+                if not re.match(r'^(\w+):', title):
+                    lang = host.split('.')[0]
+                    return 'wiki', {'lang': lang, 'title': title}, tab
             if host.endswith('huggingface.co'):
                 m = re.match(r'^/([\w.-]+)/([\w.-]+)/?$', path)
                 if m and m.group(1) not in (
@@ -481,6 +504,61 @@ class ContextuelApp(App):
             self._busy2.release()
             self.d._redraw_now()
 
+    @staticmethod
+    def _dl_img(url, https_prefix=False):
+        import io as _io
+        if not url:
+            return None
+        try:
+            import requests
+            if https_prefix and url.startswith('//'):
+                url = 'https:' + url
+            r = requests.get(url, timeout=6)
+            if r.status_code == 200:
+                from PIL import Image
+                return Image.open(_io.BytesIO(r.content)).convert('RGB')
+        except Exception:
+            pass
+        return None
+
+    def _fetch_ddg(self, q):
+        """Reponse instantanee DuckDuckGo pour une recherche (sans cle)."""
+        try:
+            import requests
+            r = requests.get('https://api.duckduckgo.com/',
+                             params={'q': q, 'format': 'json', 'no_html': 1,
+                                     'skip_disambig': 1}, timeout=7)
+            data = r.json() if r.status_code == 200 else None
+            img = self._dl_img((data or {}).get('Image'),
+                               https_prefix=True) if data else None
+            self.ddg[q] = {'t': time.time(), 'data': data, 'img': img}
+        except Exception:
+            self.ddg[q] = {'t': time.time(), 'data': None, 'img': None}
+        finally:
+            self._busy2.release()
+            self.d._redraw_now()
+
+    def _fetch_wiki(self, pl):
+        """Resume d'article Wikipedia via l'API REST officielle."""
+        key = (pl['lang'], pl['title'])
+        try:
+            import requests
+            from urllib.parse import quote
+            r = requests.get(
+                'https://{}.wikipedia.org/api/rest_v1/page/summary/{}'
+                .format(pl['lang'], quote(pl['title'])),
+                headers={'User-Agent': 'fipd-contexte/1.0'}, timeout=7)
+            data = r.json() if r.status_code == 200 else None
+            img = self._dl_img((data or {}).get('thumbnail', {}).get('source')
+                               ) if data else None
+            self.wiki[key] = {'t': time.time(), 'data': data, 'img': img}
+        except Exception as e:
+            self.wiki[key] = {'t': time.time(), 'data': None, 'img': None,
+                              'err': str(e)[:60]}
+        finally:
+            self._busy2.release()
+            self.d._redraw_now()
+
     # ---------- recuperation des donnees GitHub (thread fetcher) ----------
 
     def _fetcher(self):
@@ -578,6 +656,35 @@ class ContextuelApp(App):
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (tab.get('title') or host)
                                 .replace(' ', '+'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'wiki' and isinstance(self.pl, dict):
+            import keysend
+            pl = self.pl
+            key = (pl['lang'], pl['title'])
+            data = (self.wiki.get(key) or {}).get('data') or {}
+            url = ((data.get('content_urls') or {}).get('desktop')
+                   or {}).get('page') or \
+                'https://{}.wikipedia.org/wiki/{}'.format(
+                    pl['lang'], pl['title'].replace(' ', '_'))
+            if n == 1:
+                clipboard_set(data.get('title') or pl['title'])
+                self.alert('titre copie')
+            elif n == 2:
+                clipboard_set(url)
+                self.alert('lien copie')
+            elif n == 3:                  # meme article, autre langue
+                other = 'en' if pl['lang'] == 'fr' else 'fr'
+                os.startfile('https://{}.wikipedia.org/wiki/{}'.format(
+                    other, pl['title'].replace(' ', '_')))
+                self.alert('version ' + other.upper())
+            elif n == 4:
+                os.startfile('https://www.google.com/search?q=' +
+                             (pl['title'] + ' wikipedia').replace(' ', '+')
+                             + '&tbm=isch')
+                self.alert('images')
             elif n == 5:
                 keysend.tap('volumedown')
             elif n == 6:
@@ -1120,6 +1227,8 @@ class ContextuelApp(App):
             self._rg_gsearch(img, d)
         elif self.kind == 'chat':
             self._rg_chat(img, d)
+        elif self.kind == 'wiki':
+            self._rg_wiki(img, d)
         else:
             self._rg_default(img, d)
 
@@ -1881,7 +1990,7 @@ class ContextuelApp(App):
         d.text((140, 28), qq[0], font=F_XS, fill=charte.FG, anchor='lm')
         if len(qq) > 1:
             d.text((140, 45), qq[1], font=F_XS, fill=charte.DIM, anchor='lm')
-        # resultat de calcul
+        # resultat de calcul OU reponse instantanee (DuckDuckGo)
         if res is not None:
             d.rounded_rectangle((106, 68, 313, 118), radius=10,
                                 fill=(14, 40, 24), outline=charte.GREEN)
@@ -1893,8 +2002,43 @@ class ContextuelApp(App):
             d.text((140, 93), rs, font=fipui.font(26), fill=(150, 255, 180),
                    anchor='lm')
         else:
-            d.text((210, 93), 'calcul ? tapez ex. 3*1.25', font=F_T,
-                   fill=(90, 95, 110), anchor='mm')
+            dd = self.ddg.get(q)
+            if not dd:
+                d.text((210, 93), 'recherche de la reponse...', font=F_T,
+                       fill=(90, 95, 110), anchor='mm')
+            else:
+                data = dd.get('data') or {}
+                ans = data.get('Answer')
+                if ans:
+                    a = str(ans)
+                    while a and d.textlength(a, font=F_XS) > 190:
+                        a = a[:-1]
+                    d.rounded_rectangle((106, 68, 313, 118), radius=10,
+                                        fill=(14, 40, 24),
+                                        outline=charte.GREEN)
+                    d.text((116, 82), 'REPONSE', font=F_T, fill=charte.GREEN,
+                           anchor='lm')
+                    d.text((116, 102), a, font=F_XS, fill=(150, 255, 180),
+                           anchor='lm')
+                elif data.get('AbstractText'):
+                    heading = data.get('Heading') or q
+                    while heading and d.textlength(heading, font=F_XS) > 150:
+                        heading = heading[:-1]
+                    d.text((106, 80), heading, font=F_XS, fill=charte.FG,
+                           anchor='lm')
+                    if dd.get('img') is not None:
+                        im = dd['img'].copy()
+                        im.thumbnail((44, 44))
+                        img.paste(im, (258, 72), charte.rounded(im, 6))
+                    import textwrap
+                    yy = 98
+                    for ln in textwrap.wrap(data['AbstractText'], 30)[:3]:
+                        d.text((106, yy), ln, font=F_T, fill=charte.DIM,
+                               anchor='lm')
+                        yy += 14
+                else:
+                    d.text((210, 93), 'S2 Lucky = premier resultat',
+                           font=F_T, fill=(90, 95, 110), anchor='mm')
         charte.ico_clock(d, 111, 134, 4, charte.DIM)
         pos, tot = self._tab_pos()
         meta = self._duree() + (
@@ -1951,6 +2095,64 @@ class ContextuelApp(App):
         d.text((120, yy + 8), meta, font=F_T, fill=charte.DIM, anchor='lm')
         d.text((106, yy + 26), 'S3 Accueil = nouvelle conversation',
                font=F_T, fill=(90, 95, 110), anchor='lm')
+
+    def _rg_wiki(self, img, d):
+        """Article Wikipédia : vignette + resume DEFILENT (molette droite)."""
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        pl = self.pl or {}
+        key = (pl.get('lang'), pl.get('title'))
+        c = self.wiki.get(key) or {}
+        data = c.get('data') or {}
+        caps = [
+            (charte.ico_copy, 'Titre', '', None, False),
+            (charte.ico_link, 'Lien', '', None, False),
+            (charte.ico_home, pl.get('lang') == 'fr' and 'EN' or 'FR',
+             '', None, False),
+            (charte.ico_search, 'Images', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'WIKI', (150, 160, 200))
+        thumb = c.get('img')
+        if thumb is not None:
+            th = thumb.copy()
+            th.thumbnail((56, 56))
+            img.paste(th, (106, 12), charte.rounded(th, 8))
+        else:
+            av = charte.letter_avatar(pl.get('title') or '?', 56, 8)
+            img.paste(av, (106, 12), charte.rounded(av, 8))
+        import textwrap
+        t_lines = textwrap.wrap(data.get('title') or pl.get('title') or '?',
+                                22)[:2]
+        d.text((170, 22), t_lines[0], font=F_S, fill=charte.FG, anchor='lm')
+        if len(t_lines) > 1:
+            d.text((170, 42), t_lines[1], font=F_XS, fill=charte.DIM,
+                   anchor='lm')
+        if data.get('description'):
+            d.text((170, 56), data['description'][:26], font=F_T,
+                   fill=(150, 160, 200), anchor='lm')
+        d.line((106, 74, 313, 74), fill=charte.BORDER)
+        d.text((106, 86), 'RESUME  (molette droite = defiler)', font=F_T,
+               fill=charte.DIM, anchor='lm')
+        extract = data.get('extract') or c.get('err') or \
+            'chargement du resume...'
+        lines = textwrap.wrap(extract, 38)
+        vis = lines[self.scroll:self.scroll + 7]
+        yy = 106
+        for ln in vis:
+            d.text((106, yy), ln, font=F_T, fill=charte.FG, anchor='lm')
+            yy += 15
+        if len(lines) > 7:
+            d.rectangle((314, 100, 316, 234), fill=(30, 35, 50))
+            th_h = 134 * 7 // len(lines)
+            ty = 100 + (134 - th_h) * self.scroll // max(1, len(lines) - 7)
+            d.rectangle((314, ty, 316, ty + th_h), fill=charte.BLUE)
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

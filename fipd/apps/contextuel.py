@@ -31,7 +31,7 @@ import fipui
 from fipui import App
 
 CREATE_NO_WINDOW = 0x08000000
-POLL_S = 1.0
+POLL_S = 0.6
 TTL_S = 45.0
 AV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'avatars')
 
@@ -224,9 +224,8 @@ class ContextuelApp(App):
                         self._busy2.acquire(blocking=False):
                     threading.Thread(target=self._fetch_hf, args=(pl,),
                                      daemon=True).start()
-            if kind == 'gsearch' and pl:
-                from urllib.parse import parse_qs as _pq
-                q = (_pq(urlsplit(pl).query).get('q') or [''])[0]
+            if kind == 'gsearch' and pl is not None:
+                q = self._gq()
                 fk = 'ddg:' + q
                 if q and fk not in self._inflight and (
                         q not in self.ddg
@@ -292,6 +291,33 @@ class ContextuelApp(App):
         tab = self._fg_tab()
         if tab is not None:
             url = tab.get('url') or ''
+            # --- TITRE D'ABORD : le titre UIA est immediat alors que l'URL
+            # de la barre d'adresse peut trainer 3-4 s apres une bascule
+            # (Chrome met son arbre d'accessibilite a jour paresseusement).
+            base = (tab.get('title') or '').strip()
+            bl = base.lower()
+            m = re.match(r'^([\w.-]+)/([\w.-]+)$', base)
+            if m and len(m.group(2)) >= 2 and m.group(1) != 'www' and \
+                    f'{m.group(1)}/{m.group(2)}' not in self.invalid:
+                return 'github', f'{m.group(1)}/{m.group(2)}', tab
+            if bl.endswith('- youtube'):
+                return 'youtube', url, tab
+            if 'boîte de réception' in bl or bl.endswith('messagerie') \
+                    or ' - gmail' in bl:
+                return 'gmail', url or 'https://mail.google.com/mail/u/0/', tab
+            if bl.endswith('wikipédia') or bl.endswith('wikipedia'):
+                t = base.rsplit('—', 1)[0].strip() or base
+                return 'wiki', {'lang': 'fr' if 'wikipédia' in bl else 'en',
+                                'title': t}, tab
+            if bl.endswith('hugging face'):
+                model = re.sub(r'\s*[·-]?\s*hugging face\s*$', '', base,
+                               flags=re.I).strip()
+                if '/' in model and ' ' not in model:
+                    return 'hf', model, tab
+            if bl.endswith('- recherche google') \
+                    or bl.endswith('- google search'):
+                return 'gsearch', url, tab
+            # --- ensuite par URL (precis, mais potentiellement en retard)
             host = urlsplit(url).netloc.lower()
             path = urlsplit(url).path
             if host == 'mail.google.com':
@@ -645,62 +671,6 @@ class ContextuelApp(App):
             self._busy.release()
             self.d._redraw_now()
 
-    # ---------- familles d'onglets (navigation croisee) ----------
-    # NB : les onglets inactifs n'exposent pas leur URL — detection par
-    # TITRE. Les titres GitHub n'ont plus de suffixe '· GitHub' : on matche
-    # le motif 'owner/repo' nu + 'Pull Request'/'Issue #'.
-
-    FAMILIES = ('github', 'ghpage', 'youtube', 'gmail', 'wiki', 'hf')
-
-    def _fam_match(self, tl):
-        k = self.kind
-        if k in ('github', 'ghpage'):
-            return bool(re.match(r'^[\w.-]+/[\w.-]+$', tl)) \
-                or 'pull request' in tl or 'issue #' in tl
-        hints = {
-            'youtube': ('youtube',),
-            'gmail': ('gmail', 'messagerie', 'boîte de réception'),
-            'wiki': ('wikipédia', 'wikipedia'),
-            'hf': ('hugging face',),
-        }.get(k, ())
-        return any(h in tl for h in hints)
-
-    def _family_tabs(self):
-        """[(hwnd, titre)] des onglets de la meme famille que le contexte."""
-        if self.kind not in self.FAMILIES:
-            return []
-        out = []
-        try:
-            import uiatabs
-            for e in uiatabs.snapshot():
-                for t in e['tabs']:
-                    if (t['title'] or '').strip() and \
-                            self._fam_match(t['title'].lower()):
-                        out.append((e['hwnd'], t['title']))
-        except Exception:
-            pass
-        return out
-
-    def _cycle_tab(self, direction):
-        """Molette droite : onglet suivant/precedent de la meme famille."""
-        fam = self._family_tabs()
-        if len(fam) < 2:
-            self.alert('1 seul onglet')
-            return
-        cur = (self.tab or {}).get('title') or self.wtitle
-        titles = [t for _, t in fam]
-        try:
-            i = titles.index(cur)
-        except ValueError:
-            i = 0
-        nh, nt = fam[(i + direction) % len(fam)]
-        import uiatabs
-        u32.SetForegroundWindow(nh)
-        if uiatabs.select(nh, nt):
-            self.alert('⇄ ' + nt[:24])
-        else:
-            self.alert('selection impossible')
-
     # ---------- boutons ----------
 
     def on_event(self, name, pressed):
@@ -708,25 +678,19 @@ class ContextuelApp(App):
             return
         import webbrowser
         if name == 'right_cw':
-            if self.kind in ('wiki', 'app'):   # ces fiches utilisent le defilement
-                self.scroll += 1
-            else:
-                self._cycle_tab(+1)
+            self.scroll += 1
             return
         if name == 'right_ccw':
-            if self.kind in ('wiki', 'app'):
-                self.scroll = max(0, self.scroll - 1)
-            else:
-                self._cycle_tab(-1)
+            self.scroll = max(0, self.scroll - 1)
             return
         if name not in ('S1', 'S2', 'S3', 'S4', 'S5', 'S6'):
             return
         n = int(name[1])
         tab = self.tab or {}
-        if self.kind == 'gsearch' and self.pl:
+        if self.kind == 'gsearch':
             import keysend
-            from urllib.parse import parse_qs as _pqs, quote_plus as _qp
-            q = (_pqs(urlsplit(self.pl).query).get('q') or [''])[0]
+            from urllib.parse import quote_plus as _qp
+            q = self._gq()
             if n == 1:
                 clipboard_set(q)
                 self.alert('requete copiee')
@@ -1190,8 +1154,7 @@ class ContextuelApp(App):
         c = self.cache.get(self.repo) if self.repo else None
         ans = None
         if self.kind == 'gsearch':
-            from urllib.parse import parse_qs as _pq
-            q = (_pq(urlsplit(self.pl or '').query).get('q') or [''])[0]
+            q = self._gq()
             dd = self.ddg.get(q)
             if dd and dd.get('data'):
                 ans = {'answer': (dd['data'].get('Answer') or '')[:40],
@@ -1362,17 +1325,6 @@ class ContextuelApp(App):
             self._rg_wiki(img, d)
         else:
             self._rg_default(img, d)
-        # badge famille : les onglets du meme site se cyclent a la molette
-        if self.kind in self.FAMILIES and self.kind != 'wiki':
-            try:
-                fam_n = len(self._family_tabs())
-            except Exception:
-                fam_n = 0
-            if fam_n > 1:
-                d.rounded_rectangle((226, 222, 313, 235), radius=6,
-                                    fill=charte.CARD, outline=charte.BLUE)
-                d.text((234, 228), '{} onglets · molette'.format(fam_n),
-                       font=fipui.font(11), fill=charte.BLUE, anchor='lm')
 
     def _chip(self, d, x1, y, text, col):
         f = fipui.font(12)
@@ -2109,6 +2061,16 @@ class ContextuelApp(App):
         d.text((106, yy + 8), 'S3 = copier huggingface-cli download',
                font=F_T, fill=(90, 95, 110), anchor='lm')
 
+    def _gq(self):
+        """Requete courante : d'abord le TITRE (immediat), sinon l'URL."""
+        t = ((getattr(self, 'tab', None) or {}).get('title') or '')
+        for suf in (' - Recherche Google', ' - Google Search'):
+            if t.endswith(suf):
+                return t[:-len(suf)]
+        from urllib.parse import parse_qs as _pqs
+        return (_pqs(urlsplit(getattr(self, 'pl', '') or '').query)
+                .get('q') or [''])[0]
+
     def _rg_gsearch(self, img, d):
         """Recherche Google : requete + RESULTAT DE CALCUL local + outils."""
         from urllib.parse import parse_qs as _pqs
@@ -2116,7 +2078,7 @@ class ContextuelApp(App):
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         u = urlsplit(self.pl or '')
-        q = (_pqs(u.query).get('q') or [''])[0]
+        q = self._gq()
         tbm = (_pqs(u.query).get('tbm') or [''])[0]
         res = self._calc(q)
         caps = [

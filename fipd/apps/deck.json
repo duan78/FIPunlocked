@@ -1,0 +1,15 @@
+{
+  "pages": [
+    {
+      "title": "DECK",
+      "buttons": {
+        "S1": {"label": "Lecture / Pause", "action": {"type": "key", "combo": "playpause"}},
+        "S2": {"label": "Couper le son", "action": {"type": "key", "combo": "volumemute"}},
+        "S3": {"label": "Volume +", "action": {"type": "key", "combo": "volumeup"}},
+        "S4": {"label": "Volume -", "action": {"type": "key", "combo": "volumedown"}},
+        "S5": {"label": "Explorateur", "action": {"type": "key", "combo": "win+e"}},
+        "S6": {"label": "Bureau", "action": {"type": "key", "combo": "win+d"}}
+      }
+    }
+  ]
+}

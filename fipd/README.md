@@ -9,6 +9,7 @@ Architecture : `fipd3.py` → `DirectOutput.dll` (client pipes) → `DirectOutpu
 cd fipd
 python fipd3.py       # -> http://127.0.0.1:8199
 ```
+ou double-clic sur `demarrage.bat` (l'ancien orchestrateur SPAD est obsolète).
 Prérequis unique : le service `DirectOutputService` (déjà configuré `start= auto`).
 Si besoin (admin) : `sc start DirectOutputService`.
 
@@ -19,6 +20,8 @@ Si besoin (admin) : `sc start DirectOutputService`.
 | `POST /screen?url=https://...` | Affiche une image téléchargée |
 | `POST /video` (fichier, `X-Filename: x.mp4`) | Joue une vidéo (S1 = stop) |
 | `POST /ui` | Interface intégrée (horloge/système/réseau) |
+| `POST /apps/reload` | Recharge les apps tierces `apps/*.py` à chaud |
+| `GET/POST /app/<name>` | Endpoint propre à une app (http_get/http_post) |
 | `GET /buttons` | SSE boutons/molettes |
 | `GET /events` | Derniers événements JSON |
 | `GET /` | Page d'état |
@@ -27,6 +30,11 @@ Molette gauche = changer de page (mode ui). Masques HID : S1..S6 = 0x20..0x400,
 select=0x01, R_CW/CCW=0x02/0x04, L_CW/CCW=0x10/0x08 (confirmés matériel 19/11).
 
 ## Ce qui a été découvert (RE 19/11/2026)
+- **Auto-guérison (20/11)** : le firmware peut retomber sur son écran home
+  (cycle interne page N ↔ home ↔ page 1, boutons ↑/↓) → tous les SetImage
+  échouent en `E_PAGENOTACTIVE` et l'écran restait figé sur Saitek. Le
+  keepalive compte maintenant les échecs et re-active la page courante
+  (RemovePage+AddPage+redraw) après 2 cycles ratés.
 - **Architecture Logitech** : `DirectOutput.dll` = simple client de **pipes nommés**
   vers `DirectOutputService.exe` (SYSTEM). `Initialize` bloque indéfiniment si le
   service ne tourne pas. Le service héberge `DirectOutputSaiFip.dll` (plugin device).
@@ -47,25 +55,58 @@ select=0x01, R_CW/CCW=0x02/0x04, L_CW/CCW=0x10/0x08 (confirmés matériel 19/11)
   `ext\Saitek.FIP.dll` (UI WPF) + device raw dans SPAD.neXt.Devices.dll (obfusqué).
   SPAD streame des images rendues côté hôte (pas de serveur embarqué).
 
-## Applications fipui (20/11) — 7 pages
-Horloge, Systeme, Reseau, TEST boutons, JOURNAL (lecture molette droite),
-DEMO FIPUI (liste defilante viewport-relative : 8 items, 6 visibles alignees
-sur les boutons, LEDs suivent le viewport) et REFLEX (mini-jeu taupes : un
-bouton S1-S6 lance, LEDs miroir, vies, bonus rapidite, niveaux aux 2 molettes —
-`capture_left_knob` reserve la molette gauche au jeu sur sa page).
-NB : le FIP n'a PAS de bouton select physique (masque 0x01 jamais emis).
-Chaque page = une `fipui.App` (fipui.py) : `render(d)`, `on_event(name, pressed)`,
-`on_enter/on_leave`, `tick()`, LEDs persistantes (`set_led` re-aplique a l'entree,
-les tampons pages etant perdus au RemovePage+AddPage), alertes (`alert()` =
-bandeau rouge clignotant + LED 8, ~2 Hz). Widgets : `draw_header`, `draw_menu`,
-`draw_bar`. Le daemon gere : regle page courante, thread d'affichage unique,
-keepalive (0.3 s si alerte active), pagination, bindings (l'app cede un controle
-binde). 6 pages integrees dont la DEMO FIPUI (menu molette + toggles LED + alerte).
+## Applications fipui — 13 pages (20/11 soir)
+**Intégrées** : Horloge, Systeme, Reseau, TEST boutons, JOURNAL (lecture
+molette droite), DEMO FIPUI (liste défilante viewport-relative) et REFLEX
+(mini-jeu taupes). NB : le FIP n'a PAS de bouton select physique (0x01).
+
+**Apps tierces** (`apps/*.py`, chargées au démarrage + `POST /apps/reload`
+à chaud ; une classe `fipui.App` avec `name` != 'app' et pas `abstract` ;
+option `render_full(img)` pour coller des images ; option `http_get/http_post`
+pour exposer `/app/<name>`) :
+- **CONTEXTE** — page caméléon : s'adapte à la **fenêtre active** (processus +
+  titre ; le titre d'un navigateur = onglet actif). **Layout 2 colonnes
+  30/70 : gauche = 6 keycaps pleine hauteur alignées sur les boutons
+  physiques, droite = panneau d'infos.** Onglet GitHub → fiche repo (avatar
+  propriétaire, étoiles/issues/PR en pills, points des derniers runs,
+  workflow, PR ouverte, description) et S1-S6 = Issues/PRs/Actions/Repo/
+  copier URL/cmd clone. Autre fenêtre → 6 actions : copier titre /
+  **toujours devant** (topmost) / minimiser / tuer (2×) / **redémarrer**
+  (2×) / copier chemin exe ; panneau = avatar lettre, PID, dimensions,
+  titre défilable (molette droite). `GET /app/contexte` = contexte courant.
+  Rendu **charte graphique** (`charte.py` : palette GitHub Dark,
+  `panel`/`keycap`/`pill`/`ico_*`/`letter_avatar`/`ago` — réutilisable).
+- **CAMERAS** — flux vidéo MJPEG/RTSP plein écran, liste sur S1-S6, molette
+  droite = caméra suivante ; flux ajoutés via `POST /app/cameras`
+  (`apps/cameras.json`)
+- **DECK** — pages de boutons génériques JSON (`apps/deck.json`, rechargé à
+  chaud) : actions `key` (keysend), `url`, `http`, `run`, `alert`
+- **CI GITHUB** — statut GitHub Actions de vos repos (`gh`, auto-seed dans
+  `apps/github.json`), points vert/rouge/bleu, bouton = ouvrir le run,
+  alerte si échec CI
+- **LECTURE** — Now Playing : source SMTC (Spotify/navigateur…) **ou VLC**
+  (VLC 3.x n'a pas de SMTC → interface Web de VLC : lancer une fois
+  `activer_vlc_web.bat`, port 8080 mot de passe `fipd`, config `apps/vlc.json`).
+  Pochette en fond (SMTC), progression ; S1 pause, S2/S3 morceau/chaîne,
+  S4 source, S5/S6 volume, molette droite = seek ±10 s (désactivé sur flux
+  direct, durée inconnue) ; LED 7 = en lecture
+- **TACHES** — top 6 processus (tri CPU/RAM/DISQUE à la molette droite),
+  kill sur double-appui, processus système protégés
+- **RADIO** — webradio : catalogue auto (radio-browser.info, stations FR,
+  `apps/radio.json`), molette droite = tuner, S1-S6 = presets, titre ICY en
+  direct via ffplay (`POST /app/webradio` pour jouer/ajouter à distance)
+
+Le daemon gère : règle page courante, thread d'affichage unique, keepalive
+(0.3 s si alerte active), pagination, bindings (l'app cède un contrôle bindé).
+Widgets fipui : `draw_header`, `draw_menu`, `draw_bar`, `font(size)` (cache).
+**LEDs** : 1-6 = boutons latéraux, **7-8 = LED du bas** (libres ; 7 =
+« lecture en cours » sur LECTURE, 8 = clignotement d'alerte). Une app ne
+peut allumer ses LEDs QUE sur sa propre page (sinon un thread de fond les
+allumait sur la page affichée — corrigé 20/11).
 API : GET /apps, POST /page {"page":N}.
 
 ## Reste à faire
-- **Applis** : chargement d'apps tierces depuis un dossier apps/ (hot-load),
-  widgets supplementaires (sliders, jauges animees).
+- Widgets supplémentaires (sliders, jauges animées).
 - **Init pur (pour Linux)** : capturer les bytes wire exacts de `AddPage(0,ACTIVE)`
   côté service — proxy DLL amélioré (logger TOUS les args de Create + hooker les
   WriteFile du vrai plugin via IAT) pendant un cycle service+client. Puis :

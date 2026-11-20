@@ -1,6 +1,9 @@
 @echo off
-rem demarrage.bat — FIPd v3 (pile officielle : service DirectOutputService requis)
-cd /d %~dp0
-where python >nul 2>nul || (echo Python introuvable dans le PATH & pause & exit /b 1)
+rem =====================================================================
+rem  demarrage.bat — fipd3 (pile officielle DirectOutputService), en un
+rem  double-clic. L'ancien orchestrateur SPAD n'est plus necessaire.
+rem  Prerequis : service DirectOutputService (start=auto, deja configure).
+rem =====================================================================
+cd /d "%~dp0"
 python fipd3.py
 pause

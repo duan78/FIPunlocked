@@ -16,3 +16,12 @@ cecil/cecil_pkg/
 *.dll
 *.exe
 *.nupkg
+
+# runtime local (genere au 1er lancement)
+fipd/apps/github.json
+fipd/apps/vlc.json
+fipd/apps/radio.json
+fipd/apps/cameras.json
+fipd/apps/avatars/
+fipd/_smoke_out/
+fipd/*.err

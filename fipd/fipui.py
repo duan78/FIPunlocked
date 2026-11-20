@@ -12,6 +12,7 @@ Le daemon (fipd3) fournit : la page courante (regle E_PAGENOTACTIVE), le thread
 d'affichage unique (jamais de DirectOutput depuis un callback), la pagination
 molette gauche, le keepalive, les bindings clavier opt-in.
 """
+import os
 import time
 
 # ---- palette partagee ----
@@ -62,8 +63,15 @@ class App:
 
     # ---------- LEDs ----------
     def set_led(self, index, on):
+        """Etat voulu (re-applique a l'entree de page par restore_leds) ;
+        applique physiquement SEULEMENT si notre page est la page courante —
+        sinon un thread de fond allumerait sa LED sur la page affichee."""
         self.leds[index] = bool(on)
-        self.d.set_led(index, on)
+        try:
+            if self.d.apps[self.d.page] is self:
+                self.d.set_led(index, on)
+        except Exception:
+            pass
 
     def apply_leds(self):
         for idx, on in self.leds.items():
@@ -136,6 +144,27 @@ def draw_menu(d, font, items, cursor, states=None, y0=36, row_h=30):
             d.ellipse((284, y + 7, 300, y + 23),
                       fill=GREEN if on else (45, 50, 64),
                       outline=(160, 220, 180) if on else (80, 85, 100))
+
+
+# ---- polices (cache partage, pour les apps tierces) ----
+
+_font_cache = {}
+
+
+def font(size):
+    """Police a taille fixe (consolas -> arial -> defaut), mise en cache."""
+    if size not in _font_cache:
+        from PIL import ImageFont
+        f = ImageFont.load_default()
+        for p in (r'C:\Windows\Fonts\consola.ttf', r'C:\Windows\Fonts\arial.ttf'):
+            if os.path.exists(p):
+                try:
+                    f = ImageFont.truetype(p, size)
+                    break
+                except Exception:
+                    pass
+        _font_cache[size] = f
+    return _font_cache[size]
 
 
 def draw_bar(d, x0, y0, x1, y1, ratio, color=BLUE):

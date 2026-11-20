@@ -8,6 +8,11 @@ alertes. Pages integrees : Horloge, Systeme, Reseau, TEST boutons, Lecture, Demo
 Par defaut les touches ne pilotent QUE le FIP ; racourcis clavier opt-in via
 fipd_bindings.json (recharge a chaud) ou POST /bindings.
 
+APPS TIERCES (hot-load) : chaque fichier apps/*.py expose des sous-classes de
+fipui.App (avec name != 'app', pas 'abstract') ; chargees au demarrage et via
+POST /apps/reload. Une app peut definir http_get()/http_post(payload) -> dict,
+exposes via GET/POST /app/<name>.
+
 API http://127.0.0.1:8199 :
   POST /screen (PNG/JPG/BMP/WEBP ou ?url=)   affiche une image
   POST /video (fichier)                      joue une video (bouton S1 = stop)
@@ -15,6 +20,8 @@ API http://127.0.0.1:8199 :
   GET/POST /bindings                         racourcis clavier (JSON)
   GET /keys                                  noms de touches reconnus
   POST /led {"index":1..8,"on":bool}         LED (ou {"scan":true})
+  POST /apps/reload                          recharge apps/ a chaud
+  GET/POST /app/<name>                       endpoint propre a une app
   GET /buttons (SSE) /events /
 """
 import ctypes
@@ -33,6 +40,7 @@ PORT = 8199
 FW_BASE = 1               # ids firmware des pages : 1..N
 SCROLL_STEP = 44          # px par cran de molette (page Lecture)
 DO_DIR = r'C:\Program Files\Logitech\DirectOutput'
+APPS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'apps')
 
 os.chdir(DO_DIR)
 do = ctypes.WinDLL(os.path.join(DO_DIR, 'DirectOutput.dll'))
@@ -617,12 +625,97 @@ class Daemon:
                                              # depuis un callback du service = reentrance)
         self._gap_timer = None    # detection de l'ecran home Saitek (a sauter)
         self._own_nav = False     # nos propres activations (ne pas detecter de trou)
-        self.apps = [ClockApp(self), SystemApp(self), NetworkApp(self),
-                     TesterApp(self), ReaderApp(self), SettingsDemoApp(self),
-                     GameApp(self)]
+        self.apps = self._builtin_apps() + self._discover_apps()
 
     def _npages(self):
         return len(self.apps)
+
+    # ---------- applications (integrees + tierces hot-chargees) ----------
+
+    def _builtin_apps(self):
+        return [ClockApp(self), SystemApp(self), NetworkApp(self),
+                TesterApp(self), ReaderApp(self), SettingsDemoApp(self),
+                GameApp(self)]
+
+    def _discover_apps(self):
+        """Importe apps/*.py (hors _*.py) et instancie les fipui.App trouvees
+        (name != 'app', pas 'abstract'). Un fichier peut definir plusieurs apps."""
+        import importlib.util
+        found = []
+        if not os.path.isdir(APPS_DIR):
+            return found
+        for fn in sorted(os.listdir(APPS_DIR)):
+            if not fn.endswith('.py') or fn.startswith('_'):
+                continue
+            modname = f'_fipapp_{fn[:-3]}'
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    modname, os.path.join(APPS_DIR, fn))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception as e:
+                print(f'[apps] {fn}: import echoue: {e}', flush=True)
+                continue
+            n = 0
+            for cls in vars(mod).values():
+                if (isinstance(cls, type) and issubclass(cls, App)
+                        and cls.__module__ == modname
+                        and getattr(cls, 'name', 'app') != 'app'
+                        and not getattr(cls, 'abstract', False)):
+                    try:
+                        inst = cls(self)
+                        inst._external = True
+                        found.append(inst)
+                        n += 1
+                    except Exception as e:
+                        print(f'[apps] {fn}:{cls.__name__}: instanciation: {e}',
+                              flush=True)
+            if n:
+                print(f'[apps] {fn}: {n} app(s) chargee(s)', flush=True)
+        return found
+
+    def reload_apps(self):
+        """Reconstruit la liste complete (integrees + apps/) et re-enregistre
+        les pages firmware. L'etat des apps existantes est perdu (reinstanciees)."""
+        if self.mode != 'ui':
+            return {'error': 'mode ' + self.mode + ' actif : POST /ui avant'}
+        import sys
+        # les modules partages des apps (charte...) doivent suivre le reload :
+        # sinon python sert la version en cache et les apps plantent sur les
+        # nouveaux symboles. fipui/keysend restent (classes/interfaces vives).
+        sys.modules.pop('charte', None)
+        self._own_nav = True
+        for a in self.apps:                      # arreter les threads des apps
+            try:                                 # (fuite : instances rechargees)
+                if getattr(a, '_stop', None) is not None:
+                    a._stop.set()
+            except Exception:
+                pass
+        try:
+            self.apps[self.page].on_leave()
+        except Exception:
+            pass
+        with self.lock:
+            for i in range(self._npages()):
+                try:
+                    do.DirectOutput_RemovePage(self.hdev, FW_BASE + i)
+                except OSError:
+                    pass
+            time.sleep(0.2)
+            self.apps = self._builtin_apps() + self._discover_apps()
+            self.page = min(self.page, self._npages() - 1)
+            for i in range(self._npages()):
+                try:
+                    do.DirectOutput_AddPage(self.hdev, FW_BASE + i,
+                                            f'fipd-{self.apps[i].name}',
+                                            1 if i == self.page else 0)
+                except OSError:
+                    pass
+        self._own_nav = False
+        self._enter_app(self.page)
+        self._redraw_now()
+        return {'ok': True, 'pages': self._npages(),
+                'apps': [a.title for a in self.apps]}
 
     # ---------- demarrage pile officielle ----------
 
@@ -679,29 +772,31 @@ class Daemon:
 
     def _refresh_page(self, page, img=None):
         """Envoie le rendu de la page vers son slot firmware (avec retry).
-        NE JAMAIS appeler depuis un callback du service (reentrance RPC)."""
+        NE JAMAIS appeler depuis un callback du service (reentrance RPC).
+        Retourne True si l'image est partie."""
         if not self.hdev:
-            return
+            return False
         from PIL import Image
         img = img if img is not None else self.render_page(page)
         img = img.convert('RGB').resize((320, 240)).transpose(Image.FLIP_TOP_BOTTOM)
         buf = ctypes.create_string_buffer(img.tobytes(), 320 * 240 * 3)
         for attempt in range(3):
             if self.mode == 'ui' and page != self.page:
-                return                  # page perimee (changement pendant le rendu)
+                return False          # page perimee (changement pendant le rendu)
             try:
                 with self.lock:
                     do.DirectOutput_SetImage(self.hdev, FW_BASE + page, 0,
                                              320 * 240 * 3, buf)
                     if page == self.page:
                         self._last_raw = buf
-                return
+                return True
             except OSError as e:
                 if attempt == 2:
                     msg = (f'refresh page {page+1} echoue: {e.winerror & 0xFFFFFFFF:08X}'
                            if e.winerror else f'refresh page {page+1} echoue: {e}')
                     print(msg, flush=True)
                 time.sleep(0.25)
+        return False
 
     def _activate(self, page):
         """Rend la page COURANTE cote firmware. Empirique (probe_pages2) :
@@ -885,21 +980,46 @@ class Daemon:
     # ---------- affichage ----------
 
     def render_page(self, page=None):
-        """Rendu PIL d'une page (fond + app + alerte + footer)."""
+        """Rendu PIL d'une page (fond + app + alerte + footer).
+        Une app qui definit render_full(img) gere son rendu complet (paste
+        d'images : scroll, pochette, flux video...)."""
         from PIL import Image, ImageDraw
         page = self.page if page is None else page
         app = self.apps[page]
         img = Image.new('RGB', (320, 240), fipui.BG)
         d = ImageDraw.Draw(img)
-        if isinstance(app, ReaderApp):
-            app.render_full(img)             # necessite paste (scroll)
-        else:
-            app.render(d)
+        try:
+            if hasattr(app, 'render_full'):
+                app.render_full(img)
+                d = ImageDraw.Draw(img)      # l'alerte passe au-dessus du rendu
+                app.draw_alert(d, F_MED)
+            else:
+                app.render(d)
+                app.draw_alert(d, F_MED)
+                if app.show_footer:
+                    d.text((160, 228), 'page {}/{}  (molette gauche)'.format(
+                        page + 1, self._npages()), font=F_SML,
+                        fill=(120, 120, 130), anchor='mm')
+        except Exception as e:
+            # filet de securite : JAMAIS d'ecran noir — carte d'erreur
+            import traceback
+            print(f'render({app.name}): {e}', flush=True)
+            traceback.print_exc()
+            d = ImageDraw.Draw(img)
+            d.rectangle((0, 0, 319, 239), fill=(30, 12, 12))
+            d.rectangle((4, 4, 315, 34), fill=(120, 30, 25))
+            d.text((160, 19), 'ERREUR PAGE ' + app.title[:12], font=F_MED,
+                   fill=(255, 255, 255), anchor='mm')
+            d.text((160, 70), app.name, font=F_MED, fill=(255, 180, 170),
+                   anchor='mm')
+            msg = str(e).split('\n')[0]
+            while msg and d.textlength(msg, font=F_SML) > 300:
+                msg = msg[:-1]
+            d.text((160, 100), msg or '(erreur inconnue)', font=F_SML,
+                   fill=(255, 200, 190), anchor='mm')
+            d.text((160, 140), 'corrigez puis POST /apps/reload',
+                   font=F_SML, fill=(200, 150, 140), anchor='mm')
             app.draw_alert(d, F_MED)
-            if app.show_footer:
-                d.text((160, 228), 'page {}/{}  (molette gauche)'.format(
-                    page + 1, self._npages()), font=F_SML,
-                    fill=(120, 120, 130), anchor='mm')
         return img
 
     def _send(self, img):
@@ -934,8 +1054,8 @@ class Daemon:
                     app = self.apps[self.page]
                     try:
                         app.tick()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f'tick({app.name}): {e}', flush=True)
                     pend = getattr(self, '_pending_activate', None)
                     if pend is not None:
                         self._pending_activate = None
@@ -945,13 +1065,34 @@ class Daemon:
                         finally:
                             self._own_nav = False
                         self._enter_app(pend)    # tampons perdus : LEDs a re-appliquer
-                    self._refresh_page(self.page)
+                    ok = self._refresh_page(self.page)
+                    # AUTO-GUERISON : le firmware est tombe sur son ecran home
+                    # (ou la page a perdu son etat actif) -> E_PAGENOTACTIVE a
+                    # repetition. On re-active la page courante et on redessine.
+                    if ok:
+                        self._fails = 0
+                    else:
+                        self._fails = getattr(self, '_fails', 0) + 1
+                        if self._fails >= 2:
+                            print(f'[auto-guerison] re-activation page '
+                                  f'{self.page + 1} (echecs: {self._fails})',
+                                  flush=True)
+                            self._own_nav = True
+                            try:
+                                self._activate(self.page)
+                            finally:
+                                self._own_nav = False
+                            self._enter_app(self.page)
+                            self._refresh_page(self.page)
+                            self._fails = 0
                 elif getattr(self, '_last_raw', None):
                     with self.lock:
                         do.DirectOutput_SetImage(self.hdev, FW_BASE, 0,
                                                  320 * 240 * 3, self._last_raw)
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                print('keepalive:', e, flush=True)
+                traceback.print_exc()
 
     # ---------- video ----------
 
@@ -1020,9 +1161,23 @@ class H(BaseHTTPRequestHandler):
             self._json({'keys': keysend.key_names(),
                         'exemple': 'ctrl+shift+s, volumemute, f5, alt+tab'})
         elif self.path == '/apps':
-            self._json({'apps': [{'index': i, 'name': a.name, 'title': a.title}
+            D.bindings.reload()
+            self._json({'apps': [{'index': i, 'name': a.name, 'title': a.title,
+                                  'external': getattr(a, '_external', False)}
                                  for i, a in enumerate(D.apps)],
-                        'page': D.page})
+                        'page': D.page, 'mode': D.mode})
+        elif self.path.startswith('/app/'):
+            name = self.path[len('/app/'):].strip('/')
+            app = next((a for a in D.apps if a.name == name), None)
+            if app is None:
+                return self._json({'error': f'app inconnue: {name}'}, 404)
+            h = getattr(app, 'http_get', None)
+            if h is None:
+                return self._json({'error': f'{name} n expose pas http_get'}, 405)
+            try:
+                return self._json(h())
+            except Exception as e:
+                return self._json({'error': str(e)}, 500)
         elif self.path == '/':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -1072,6 +1227,20 @@ class H(BaseHTTPRequestHandler):
                 D.mode = 'ui'
                 D._switch_page(max(0, min(D._npages() - 1, int(dd.get('page', 0)))))
                 return self._json({'ok': True, 'page': D.page})
+            if self.path == '/apps/reload':
+                return self._json(D.reload_apps())
+            if self.path.startswith('/app/'):
+                name = self.path[len('/app/'):].strip('/')
+                app = next((a for a in D.apps if a.name == name), None)
+                if app is None:
+                    return self._json({'error': f'app inconnue: {name}'}, 404)
+                h = getattr(app, 'http_post', None)
+                if h is None:
+                    return self._json({'error': f'{name} n expose pas http_post'}, 405)
+                try:
+                    return self._json(h(json.loads(body or b'{}')))
+                except Exception as e:
+                    return self._json({'error': str(e)}, 500)
             if self.path == '/bindings':
                 try:
                     cfg = json.loads(body)

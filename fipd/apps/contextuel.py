@@ -2795,7 +2795,7 @@ class ContextuelApp(App):
             d.text((106, 200), 'Serper {:,.0f} / {:,.0f}'.format(
                 sv, sm).replace(',', ' '), font=F_XS, fill=charte.FG,
                 anchor='lm')
-            charte.draw_bar(d, 106, 212, 313, 222, sv / sm,
+            fipui.draw_bar(d, 106, 212, 313, 222, sv / sm,
                             charte.ORANGE if sv / sm > 0.8 else charte.BLUE)
         else:
             d.text((106, 200), 'Serper —', font=F_XS, fill=charte.DIM,

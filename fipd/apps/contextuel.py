@@ -243,11 +243,13 @@ class ContextuelApp(App):
                     self._inflight.add(fk)
                     threading.Thread(target=self._fetch_wiki, args=(dict(pl),),
                                      daemon=True).start()
-            if kind == 'gsc' and \
-                    (self.gsc is None or time.time() - self.gsc['t'] > 8) \
-                    and 'gsc' not in self._inflight:
-                self._inflight.add('gsc')
-                threading.Thread(target=self._fetch_gsc, daemon=True).start()
+            if kind == 'gsc':
+                k = pl or title[:80]
+                if (self.gsc is None or self.gsc.get('k') != k) \
+                        and 'gsc' not in self._inflight:
+                    self._inflight.add('gsc')
+                    threading.Thread(target=self._fetch_gsc, args=(k,),
+                                     daemon=True).start()
             if kind == 'explorer':
                 self.exp_sel = self._explorer_sel()
             changed = (repo, kind, pl, proc, title[:60]) != last
@@ -618,7 +620,7 @@ class ContextuelApp(App):
             self._inflight.discard(fk)
             self.d._redraw_now()
 
-    def _fetch_gsc(self):
+    def _fetch_gsc(self, key=''):
         """Search Console : LIT la page affichee via l'arbre d'accessibilite.
         Le walk s'execute DANS le thread UIA dedie (uiatabs) — l'objet COM
         global du paquet n'est pas utilisable depuis un autre thread."""
@@ -682,7 +684,7 @@ class ContextuelApp(App):
             }
         except Exception as e:
             print('[gsc]', str(e)[:60], flush=True)
-        self.gsc = {'t': time.time(), 'm': metrics}
+        self.gsc = {'t': time.time(), 'm': metrics, 'k': key}
         self._inflight.discard('gsc')
         self.d._redraw_now()
 
@@ -826,10 +828,14 @@ class ContextuelApp(App):
                                   m.get('ctr') or '?',
                                   m.get('position') or '?'))
                 self.alert('valeurs copiees')
-            elif n == 4:
-                webbrowser.open('https://www.google.com/search?q=' +
-                                (tab.get('title') or 'search console')
-                                .replace(' ', '+'))
+            elif n == 4:                     # relire l'ecran maintenant
+                if 'gsc' not in self._inflight:
+                    self._inflight.add('gsc')
+                    threading.Thread(
+                        target=self._fetch_gsc,
+                        args=((self.gsc or {}).get('k') or self.pl or '',),
+                        daemon=True).start()
+                    self.alert('relecture...')
             elif n == 5:
                 keysend.tap('volumedown')
             elif n == 6:
@@ -2382,7 +2388,7 @@ class ContextuelApp(App):
             (charte.ico_link, 'URL', '', None, False),
             (charte.ico_copy, 'Titre', '', None, False),
             (charte.ico_copy, 'Valeurs', '', None, False),
-            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_clock, 'Relire', '', None, False),
             (charte.ico_min, 'Vol-', '', None, False),
             (charte.ico_min, 'Vol+', '', None, False),
         ]
@@ -2416,12 +2422,10 @@ class ContextuelApp(App):
             v = val if val else '—'
             f = fipui.font(24 if len(v) <= 6 else 18)
             d.text((x0 + 8, y0 + 33), v, font=f, fill=col, anchor='lm')
-        d.text((106, 190), 'MAJ auto 8 s — change la periode ou les filtres',
+        d.text((106, 196), 'lecture de l\'ecran a l\'ouverture de la page',
                font=F_T, fill=(90, 95, 110), anchor='lm')
-        d.text((106, 206), 'dans Chrome, la fiche suit.', font=F_T,
-               fill=(90, 95, 110), anchor='lm')
-        d.text((106, 228), 'S3 = copier les 4 valeurs', font=F_T,
-               fill=(90, 95, 110), anchor='lm')
+        d.text((106, 214), 'S3 = copier les 4 valeurs · S4 = relire',
+               font=F_T, fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

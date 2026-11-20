@@ -31,7 +31,7 @@ import fipui
 from fipui import App
 
 CREATE_NO_WINDOW = 0x08000000
-POLL_S = 0.6
+POLL_S = 0.4
 TTL_S = 45.0
 AV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'avatars')
 
@@ -161,6 +161,9 @@ class ContextuelApp(App):
         self.ddg = {}                  # requete -> {'t', 'data', 'img'}
         self.wiki = {}                 # (lang, titre) -> {'t', 'data', 'img'}
         self.gsc = None                # {'t', 'm': {clics, impressions,...}}
+        self.pages = {}                # url -> {'t', 'lines'} (lecture ecran)
+        self._title_t = 0.0            # horodatage du dernier changement de TITRE
+        self._url_t = 0.0              # horodatage du dernier changement d'URL
         self._inflight = set()         # cles de fetch en cours (sans blocage)
         self._busy2 = threading.Lock()     # serialise les fetchs detailles
         self.exp_sel = []              # fichiers selectionnes (explorer)
@@ -203,6 +206,13 @@ class ContextuelApp(App):
                     self.exe = ''
             kind, pl, self.tab = self._classify(title)
             self.kind, self.pl = kind, pl
+            tt = (self.tab or {}).get('title')
+            if tt != getattr(self, '_lt', None):
+                self._lt = tt
+                self._title_t = time.time()      # titre plus frais que l'URL ?
+            if pl != getattr(self, '_lu', None):
+                self._lu = pl
+                self._url_t = time.time()
             repo = pl if kind == 'github' else None
             if repo and repo in self.invalid:
                 repo = None
@@ -212,6 +222,11 @@ class ContextuelApp(App):
                 host = urlsplit(pl).netloc
                 if host and host not in self.fav:
                     self._fav_fetch(host)
+                fk = 'page:' + pl[:120]
+                if pl not in self.pages and fk not in self._inflight:
+                    self._inflight.add(fk)
+                    threading.Thread(target=self._fetch_page,
+                                     args=(pl,), daemon=True).start()
             if kind == 'ghpage' and isinstance(pl, dict):
                 key = (pl['repo'], pl['kind'], pl['n'])
                 c = self.ghd.get(key)
@@ -619,6 +634,58 @@ class ContextuelApp(App):
         finally:
             self._inflight.discard(fk)
             self.d._redraw_now()
+
+    def _fetch_page(self, url):
+        """Lecture d'ecran GENERIQUE : quelques lignes de contenu de la page
+        (pour la fiche site) — executee une seule fois par URL."""
+        import uiatabs
+
+        def read_page():
+            import uiautomation as auto
+            c = auto.ControlFromHandle(self.hwnd)
+            texts = []
+            t0 = time.time()
+
+            def walk(ctrl, depth):
+                if depth > 40 or len(texts) > 4000 \
+                        or time.time() - t0 > 2.5:
+                    return
+                try:
+                    kids = ctrl.GetChildren()
+                except Exception:
+                    return
+                for ch in kids:
+                    try:
+                        n = (ch.Name or '').strip()
+                        if n and len(n) < 220:
+                            texts.append(n)
+                    except Exception:
+                        pass
+                    walk(ch, depth + 1)
+
+            if c is not None:
+                walk(c, 0)
+            return texts
+
+        lines = []
+        try:
+            texts = uiatabs.run_in_uia_thread(read_page) or []
+            seen = set()
+            cands = []
+            for t in texts:
+                t = ' '.join(t.split())          # normaliser les espaces
+                if not (28 <= len(t) <= 200) or t in seen:
+                    continue
+                if not re.search(r'[a-zà-ÿ]{4}', t, re.I):
+                    continue
+                seen.add(t)
+                cands.append(t)
+            lines = cands[2:8]                   # sauter header/nav
+        except Exception as e:
+            print('[page]', str(e)[:50], flush=True)
+        self.pages[url] = {'t': time.time(), 'lines': lines}
+        self._inflight.discard('page:' + url[:120])
+        self.d._redraw_now()
 
     def _fetch_gsc(self, key=''):
         """Search Console : LIT la page affichee via l'arbre d'accessibilite.
@@ -1647,18 +1714,24 @@ class ContextuelApp(App):
                           hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
         charte.panel(d, (98, 4, 317, 238))
         self._chip(d, 311, 10, 'WEB', charte.TEAL)
-        # en-tete : favicon + domaine (comme avatar + repo de la fiche GitHub)
-        fav = self.fav.get(host)
-        if fav is not None:
-            f2 = fav.resize((36, 36))
-            img.paste(f2, (106, 12), f2)
+        # titre plus recent que l'URL (bascule site->site, Chrome paresseux) :
+        # ne pas afficher l'ANCIEN domaine — zone en attente honnete
+        pending = self._title_t > self._url_t + 0.3
+        if pending:
+            d.text((152, 24), '(nouveau site...)', font=F_S, fill=charte.DIM,
+                   anchor='lm')
         else:
-            av = charte.letter_avatar(host, 36, 8)
-            img.paste(av, (106, 12), charte.rounded(av, 8))
-        h2 = host.replace('www.', '')
-        while h2 and d.textlength(h2, font=F_S) > 150:
-            h2 = h2[:-1]
-        d.text((152, 24), h2, font=F_S, fill=charte.FG, anchor='lm')
+            fav = self.fav.get(host)
+            if fav is not None:
+                f2 = fav.resize((36, 36))
+                img.paste(f2, (106, 12), f2)
+            else:
+                av = charte.letter_avatar(host, 36, 8)
+                img.paste(av, (106, 12), charte.rounded(av, 8))
+            h2 = host.replace('www.', '')
+            while h2 and d.textlength(h2, font=F_S) > 150:
+                h2 = h2[:-1]
+            d.text((152, 24), h2, font=F_S, fill=charte.FG, anchor='lm')
         pos, tot = self._tab_pos()
         charte.ico_clock(d, 157, 45, 4, charte.DIM)
         meta = self._duree()
@@ -1668,26 +1741,35 @@ class ContextuelApp(App):
         # zone URL
         d.line((106, 62, 313, 62), fill=charte.BORDER)
         d.text((106, 76), 'URL', font=F_T, fill=charte.DIM, anchor='lm')
-        v = self.pl or ''
+        v = '...' if pending else (self.pl or '')
         while v and d.textlength(v, font=F_T) > 165:
             v = v[:-1]
         d.text((140, 76), v, font=F_T, fill=(120, 160, 230), anchor='lm')
-        # zone titre (grand, comme le nom du repo)
+        # zone titre (2 lignes) + PAGE lue sur l'ecran
         d.line((106, 92, 313, 92), fill=charte.BORDER)
         d.text((106, 104), 'TITRE', font=F_T, fill=charte.DIM, anchor='lm')
         import textwrap
-        lines = textwrap.wrap(tab.get('title') or host, 34)[:4] or [' ']
-        yy = 124
-        for ln in lines:
-            d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
-            yy += 17
-        # bas de panneau : chemin de l'URL
-        d.line((106, 196, 313, 196), fill=charte.BORDER)
-        path = (u.path + ('?' + u.query[:24] if u.query else '')) or '/'
-        while path and d.textlength(path, font=F_T) > 200:
-            path = path[:-1]
-        d.text((106, 210), path, font=F_T, fill=(110, 118, 129), anchor='lm')
-        d.text((106, 226), 'fenetre: ' + self.proc, font=F_T,
+        tl = textwrap.wrap(tab.get('title') or host, 34)[:2] or [' ']
+        d.text((106, 120), tl[0], font=F_XS, fill=charte.FG, anchor='lm')
+        if len(tl) > 1:
+            d.text((106, 137), tl[1], font=F_XS, fill=charte.FG, anchor='lm')
+        d.line((106, 154, 313, 154), fill=charte.BORDER)
+        pg = self.pages.get(self.pl) or {}
+        plines = pg.get('lines') or []
+        d.text((106, 166), 'PAGE (lecture ecran)', font=F_T,
+               fill=(120, 160, 230), anchor='lm')
+        yy = 184
+        if not pg:
+            d.text((106, yy), 'lecture de la page...', font=F_T,
+                   fill=charte.DIM, anchor='lm')
+        else:
+            for ln in plines[:4]:
+                while ln and d.textlength(ln, font=F_T) > 200:
+                    ln = ln[:-1]
+                d.text((106, yy), ln, font=F_T, fill=charte.FG,
+                       anchor='lm')
+                yy += 15
+        d.text((106, 231), 'S3 recherche site · S4 traduire', font=F_T,
                fill=(90, 95, 110), anchor='lm')
 
     def _rg_zoom(self, img, d):

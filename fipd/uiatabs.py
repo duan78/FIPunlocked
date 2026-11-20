@@ -23,7 +23,8 @@ u32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM),
                             wt.LPARAM]
 
 BROWSERS = ('chrome.exe', 'msedge.exe')
-REFRESH_S = 0.6            # cycle de rafraichissement (scan ~0,1 s cache)
+FAST_S = 0.35              # thread Win32 pur : titres toujours frais
+UIA_S = 0.8                # thread UIA : URL/onglets (peut trainer)
 URL_STICKY_S = 8.0         # garder la derniere URL connue si lecture ratee
 BROWSER_SUFFIXES = (' - Google Chrome', ' - Microsoft\xad Edge',
                     ' - Mozilla Firefox', ' - Brave', ' - Opera', ' - Vivaldi')
@@ -33,6 +34,7 @@ _snap = []                      # [{'hwnd','proc','title','url','tabs':[...] }]
 _last_url = {}                  # hwnd -> (url, t) : URL collante anti-flicker
 _el_cache = {}                  # hwnd -> {'edit': ctrl, 'strip': ctrl}
 _last_state = {}                # hwnd -> {'url','tabs'} : dernier etat UIA
+_proc_cache = {}                # hwnd -> nom de processus (calcule une fois)
 _jobs = []                      # [(fn, queue)] : taches a executer DANS le
 _stop = threading.Event()       # thread UIA (meme appartement COM)
 _started = False
@@ -144,8 +146,8 @@ def _cached(hwnd, key, finder):
 
 def _browser_windows():
     """[(hwnd, proc, titre)] des fenetres navigateurs — 100 % Win32,
-    donc IMMUNISEE contre les blocages UIA de Chrome."""
-    import psutil
+    donc IMMUNISEE contre les blocages UIA de Chrome. Processus mis en
+    cache par fenetre (psutil une seule fois par hwnd)."""
     found = []
     ENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
@@ -158,12 +160,16 @@ def _browser_windows():
     u32.EnumWindows(cb, 0)
     out = []
     for h in found:
-        try:
-            pid = wt.DWORD()
-            u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
-            proc = psutil.Process(pid.value).name().lower()
-        except Exception:
-            continue
+        proc = _proc_cache.get(h)
+        if proc is None:
+            try:
+                import psutil
+                pid = wt.DWORD()
+                u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                proc = psutil.Process(pid.value).name().lower()
+                _proc_cache[h] = proc
+            except Exception:
+                continue
         if proc in BROWSERS:
             out.append((h, proc, _win_title(h)))
     return out
@@ -241,12 +247,23 @@ def _uia_pass():
     _publish(out)
 
 
-def _loop():
+def _fast_loop():
+    """Thread Win32 PUR (aucun COM) : publie les titres frais toutes les
+    0,35 s — insensible aux blocages UIA de Chrome (l'autre thread peut
+    rester bloque plusieurs secondes, celui-ci ne faiblit jamais)."""
+    while not _stop.is_set():
+        try:
+            _fast_pass()
+        except Exception as e:
+            print('[uiatabs/fast]', e, flush=True)
+        _stop.wait(FAST_S)
+
+
+def _uia_loop():
     import comtypes
     comtypes.CoInitialize()          # une seule fois : l'appartement COM
     while not _stop.is_set():        # doit survivre aux elements caches
         try:
-            _fast_pass()
             _uia_pass()
         except Exception as e:
             print('[uiatabs]', e, flush=True)
@@ -256,7 +273,7 @@ def _loop():
                 q.put(fn())
             except Exception as e:
                 q.put(e)
-        _stop.wait(REFRESH_S)
+        _stop.wait(UIA_S)
 
 
 def snapshot():
@@ -264,7 +281,8 @@ def snapshot():
     global _started
     if not _started:
         _started = True
-        threading.Thread(target=_loop, daemon=True).start()
+        threading.Thread(target=_fast_loop, daemon=True).start()
+        threading.Thread(target=_uia_loop, daemon=True).start()
     with _lock:
         return [dict(e, tabs=list(e['tabs'])) for e in _snap]
 

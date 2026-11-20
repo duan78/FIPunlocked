@@ -93,7 +93,8 @@ pour exposer `/app/<name>`) :
   **Wikipédia** → vignette + description + **résumé défilant à la molette**
   (API REST summary), bascule EN/FR, images ; **chat IA** (z.ai, ChatGPT, Claude, Le Chat) →
   conversation + accueil/nouvelle discussion ; **onglet web**
-  → favicon + domaine + titre +
+  → favicon + domaine + titre + zone **PAGE (lecture écran)** : quelques
+  lignes du contenu lues sur la page (une fois par URL) +
   URL (copies, Google, domaine, volume) ; **app Windows** → fiches par
   application : **Explorateur** (chemin réel via COM Shell.Application,
   nb d'éléments, espace libre ; copier chemin / chemin unix / terminal ici

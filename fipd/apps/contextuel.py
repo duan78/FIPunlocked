@@ -161,6 +161,9 @@ class ContextuelApp(App):
         self.exp_sel = []              # fichiers selectionnes (explorer)
         self._exp = {'t': 0.0, 'map': {}}   # hwnd -> (chemin, obj, sel)
         self._com_init = False
+        self.exp_zoom = False          # apercu image plein ecran
+        self._zoom_file = None
+        self._player = None            # ffplay (audio local)
         self.scroll = 0
         self.exe = ''                 # chemin de l'exe au premier plan
         self.topmost = False
@@ -640,58 +643,127 @@ class ContextuelApp(App):
         elif self.kind == 'explorer' and self.pl:
             path = self.pl
             sel = self.exp_sel or []
-            fpath = sel[0] if (sel and os.path.isfile(sel[0])) else path
-            if n == 1:                        # chemin (fichier si selection)
-                clipboard_set(fpath)
-                self.alert('chemin copie')
-            elif n == 2:                       # terminal dans ce dossier
-                try:
-                    subprocess.Popen(['wt', '-d', path])
-                except FileNotFoundError:
-                    subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k',
-                                      'cd', '/d', path])
-                self.alert('terminal ouvert')
-            elif n == 3:
-                clipboard_set(self._unix_path(fpath))
-                self.alert('chemin unix copie')
-            elif n == 4:                       # remonter au dossier parent
-                parent = os.path.dirname(path.rstrip('\\/'))
-                if parent and parent != path:
+            single = self._sel_single()
+            fk = self._filekind(single) if single else None
+            if fk:                             # --- selection unique typee
+                if n == 1:
+                    clipboard_set(single)
+                    self.alert('chemin copie')
+                elif n == 2:
+                    clipboard_set(self._unix_path(single))
+                    self.alert('unix copie')
+                elif n == 3:
+                    if fk == 'image':          # zoom plein ecran
+                        self.exp_zoom = not self.exp_zoom
+                        self._zoom_file = single if self.exp_zoom else None
+                    elif fk == 'video':        # lecture SUR LE FIP
+                        threading.Thread(
+                            target=lambda: self.d.play_video(single),
+                            daemon=True).start()
+                        self.alert('video sur le FIP')
+                    elif fk == 'audio':        # ffplay (stop si en cours)
+                        if self._player is not None and \
+                                self._player.poll() is None:
+                            self._player.terminate()
+                            self._player = None
+                            self.alert('arret audio')
+                        else:
+                            import shutil
+                            ff = shutil.which('ffplay')
+                            if ff:
+                                self._player = subprocess.Popen(
+                                    [ff, '-nodisp', '-autoexit',
+                                     '-loglevel', 'quiet', single])
+                                self.alert('lecture audio')
+                            else:
+                                self.alert('ffplay introuvable')
+                    elif fk == 'py':           # executer dans un terminal
+                        try:
+                            subprocess.Popen(['wt', 'python', single])
+                        except FileNotFoundError:
+                            subprocess.Popen(['cmd', '/c', 'start', 'cmd',
+                                              '/k', 'python', single])
+                        self.alert('execution...')
+                    elif fk == 'zip':
+                        try:
+                            import zipfile
+                            with zipfile.ZipFile(single) as z:
+                                self.alert('{} fichiers'.format(
+                                    len(z.infolist())))
+                        except Exception as e:
+                            self.alert(str(e)[:24])
+                    else:                      # autre : dossier parent
+                        parent = os.path.dirname(path.rstrip('\\/'))
+                        if parent and parent != path:
+                            os.startfile(parent)
+                            self.alert('dossier parent')
+                elif n == 4:                   # VS Code
+                    try:
+                        subprocess.Popen(['code', single])
+                        self.alert('VS Code')
+                    except FileNotFoundError:
+                        self.alert('code absent du PATH')
+                elif n == 5:                   # terminal du dossier
+                    try:
+                        subprocess.Popen(['wt', '-d', path])
+                    except FileNotFoundError:
+                        subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k',
+                                          'cd', '/d', path])
+                    self.alert('terminal ouvert')
+                elif n == 6:
                     w = self._explorer_obj()
-                    done = False
                     if w is not None:
                         try:
-                            w.Navigate2(parent)
-                            done = True
+                            w.Refresh()
+                            self.alert('actualise')
                         except Exception:
                             pass
-                    if not done:
-                        os.startfile(parent)
-                    self.alert('dossier parent')
-                else:
-                    self.alert('deja a la racine')
-            elif n == 5:
-                if sel:                        # ouvrir la selection dans code
-                    target = sel[0] if len(sel) == 1 else path
+            else:                               # --- dossier / multi
+                fpath = sel[0] if sel else path
+                if n == 1:
+                    clipboard_set(fpath)
+                    self.alert('chemin copie')
+                elif n == 2:
+                    try:
+                        subprocess.Popen(['wt', '-d', path])
+                    except FileNotFoundError:
+                        subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k',
+                                          'cd', '/d', path])
+                    self.alert('terminal ouvert')
+                elif n == 3:
+                    clipboard_set(self._unix_path(fpath))
+                    self.alert('chemin unix copie')
+                elif n == 4:
+                    parent = os.path.dirname(path.rstrip('\\/'))
+                    if parent and parent != path:
+                        w = self._explorer_obj()
+                        done = False
+                        if w is not None:
+                            try:
+                                w.Navigate2(parent)
+                                done = True
+                            except Exception:
+                                pass
+                        if not done:
+                            os.startfile(parent)
+                        self.alert('dossier parent')
+                    else:
+                        self.alert('deja a la racine')
+                elif n == 5:
+                    target = sel[0] if sel else path
                     try:
                         subprocess.Popen(['code', target])
                         self.alert('VS Code')
                     except FileNotFoundError:
                         self.alert('code absent du PATH')
-                else:
-                    try:
-                        subprocess.Popen(['code', path])
-                        self.alert('VS Code (dossier)')
-                    except FileNotFoundError:
-                        self.alert('code absent du PATH')
-            elif n == 6:                       # actualiser la fenetre
-                w = self._explorer_obj()
-                if w is not None:
-                    try:
-                        w.Refresh()
-                        self.alert('actualise')
-                    except Exception:
-                        self.alert('rafraichissement impossible')
+                elif n == 6:
+                    w = self._explorer_obj()
+                    if w is not None:
+                        try:
+                            w.Refresh()
+                            self.alert('actualise')
+                        except Exception:
+                            pass
         elif self.kind == 'code' and isinstance(self.pl, dict):
             import keysend
             if n == 1:
@@ -864,6 +936,54 @@ class ContextuelApp(App):
         except Exception:
             return None
 
+    @staticmethod
+    def _fsize(n):
+        if n >= 2**30:
+            return '{:.1f} Go'.format(n / 2**30)
+        if n >= 2**20:
+            return '{:.1f} Mo'.format(n / 2**20)
+        if n >= 1024:
+            return '{:.0f} Ko'.format(n / 1024)
+        return '{} o'.format(n)
+
+    @staticmethod
+    def _filekind(f):
+        """Type contextuel d'un fichier (actions dediees par extension)."""
+        ext = os.path.splitext(f)[1].lower()
+        if ext in ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif'):
+            return 'image'
+        if ext in ('.mp4', '.mkv', '.webm', '.avi', '.mov'):
+            return 'video'
+        if ext in ('.mp3', '.flac', '.wav', '.ogg', '.m4a', '.opus'):
+            return 'audio'
+        if ext == '.py':
+            return 'py'
+        if ext == '.zip':
+            return 'zip'
+        return 'autre'
+
+    @staticmethod
+    def _mtime_h(path):
+        m = int((time.time() - os.path.getmtime(path)) / 60)
+        if m < 60:
+            return '{} min'.format(m)
+        if m < 2880:
+            return '{} h'.format(m // 60)
+        return '{} j'.format(m // 1440)
+
+    def _sel_single(self):
+        sel = self.exp_sel or []
+        if len(sel) == 1 and os.path.isfile(sel[0]):
+            return sel[0]
+        return None
+
+    def on_leave(self):
+        if self._player is not None and self._player.poll() is None:
+            try:
+                self._player.terminate()
+            except Exception:
+                pass
+
     def _tab_pos(self):
         """(index_actif, total) des onglets de la fenetre au premier plan."""
         if not self.hwnd:
@@ -901,7 +1021,10 @@ class ContextuelApp(App):
         elif self.kind == 'site':
             self._rg_site(img, d)
         elif self.kind == 'explorer':
-            self._rg_explorer(img, d)
+            if self.exp_zoom and self._zoom_file:
+                self._rg_zoom(img, d)
+            else:
+                self._rg_explorer(img, d)
         elif self.kind == 'code':
             self._rg_code(img, d)
         elif self.kind == 'terminal':
@@ -1157,24 +1280,75 @@ class ContextuelApp(App):
         d.text((106, 226), 'fenetre: ' + self.proc, font=F_T,
                fill=(90, 95, 110), anchor='lm')
 
+    def _rg_zoom(self, img, d):
+        """Apercu plein ecran de l'image selectionnee (S3 = retour)."""
+        from PIL import Image as PILImage, ImageDraw
+        try:
+            im = PILImage.open(self._zoom_file).convert('RGB')
+        except Exception:
+            self.exp_zoom = False
+            return self._rg_explorer(img, d)
+        r = max(320 / im.width, 240 / im.height)
+        im = im.resize((int(im.width * r) + 1, int(im.height * r) + 1))
+        x, y = (im.width - 320) // 2, (im.height - 240) // 2
+        img.paste(im.crop((x, y, x + 320, y + 240)), (0, 0))
+        d = ImageDraw.Draw(img, 'RGBA')
+        d.rectangle((0, 0, 319, 20), fill=(0, 0, 0, 150))
+        d.text((8, 10), os.path.basename(self._zoom_file)[:36],
+               font=fipui.font(13), fill=(255, 255, 255), anchor='lm')
+        try:
+            d.text((312, 10), self._fsize(os.path.getsize(self._zoom_file)),
+                   font=fipui.font(13), fill=(255, 255, 255), anchor='rm')
+        except OSError:
+            pass
+
     def _rg_explorer(self, img, d):
         F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         path = self.pl or '?'
         sel = self.exp_sel or []
-        sel1 = 'fichier' if (sel and os.path.isfile(sel[0])) else \
-            (str(len(sel)) if sel else '')
+        single = self._sel_single()
+        fk = self._filekind(single) if single else None
+        if single != self._zoom_file:
+            self._zoom_file = None
+            self.exp_zoom = False
         is_dir = os.path.isdir(path)
         name = os.path.basename(path.rstrip('\\/')) or path
-        caps = [
-            (charte.ico_copy, 'Chemin', sel1 if sel else '', None, False),
-            (charte.ico_terminal, 'Terminal', '', None, False),
-            (charte.ico_copy, 'Unix', '', None, False),
-            (charte.ico_folder, 'Parent', '', None, False),
-            (charte.ico_code, 'VS Code', '', None, bool(sel)),
-            (charte.ico_clock, 'MAJ', '', None, False),
-        ]
+        # keycaps contextuels : par type de fichier si selection unique
+        if fk:
+            playing = self._player is not None and self._player.poll() is None
+            act3 = {
+                'image': (charte.ico_window, 'Zoom',
+                          'ON' if self.exp_zoom else '',
+                          charte.BLUE if self.exp_zoom else None,
+                          self.exp_zoom),
+                'video': (charte.ico_play, 'Lire', '', None, False),
+                'audio': (charte.ico_play, 'Jouer', 'STOP' if playing else '',
+                          charte.GREEN if playing else None, playing),
+                'py': (charte.ico_terminal, 'Exec', '', None, False),
+                'zip': (charte.ico_copy, 'Nb', '', None, False),
+                'autre': (charte.ico_folder, 'Parent', '', None, False),
+            }[fk]
+            caps = [
+                (charte.ico_copy, 'Chemin', '', None, False),
+                (charte.ico_copy, 'Unix', '', None, False),
+                act3,
+                (charte.ico_code, 'VS Code', '', None, False),
+                (charte.ico_terminal, 'Term.', '', None, False),
+                (charte.ico_clock, 'MAJ', '', None, False),
+            ]
+        else:
+            caps = [
+                (charte.ico_copy, 'Chemin',
+                 'fichier' if sel else str(len(sel)) if sel else '',
+                 None, False),
+                (charte.ico_terminal, 'Terminal', '', None, False),
+                (charte.ico_copy, 'Unix', '', None, False),
+                (charte.ico_folder, 'Parent', '', None, False),
+                (charte.ico_code, 'VS Code', '', None, bool(sel)),
+                (charte.ico_clock, 'MAJ', '', None, False),
+            ]
         for i, (ic, lab, val, col, hot) in enumerate(caps):
             charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
                           hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
@@ -1198,8 +1372,53 @@ class ContextuelApp(App):
                    anchor='lm')
             yy += 17
         d.line((106, yy - 4, 313, yy - 4), fill=charte.BORDER)
-        if sel:
-            # zone selection : fichiers selectionnes dans la fenetre
+        if single:
+            # zone fichier : nom + meta + miniature/infos selon le type
+            d.text((106, yy + 8), 'SELECTION', font=F_T, fill=charte.ORANGE,
+                   anchor='lm')
+            import textwrap
+            s0 = os.path.basename(single)
+            y2 = yy + 26
+            for ln in textwrap.wrap(s0, fk == 'image' and 20 or 34)[:2]:
+                d.text((106, y2), ln, font=F_XS, fill=charte.FG, anchor='lm')
+                y2 += 17
+            try:
+                st = os.stat(single)
+                info = '{}  ·  {}'.format(self._fsize(st.st_size),
+                                          self._mtime_h(single))
+            except OSError:
+                info = '?'
+            extra = ''
+            if fk == 'py':
+                try:
+                    with open(single, encoding='utf-8',
+                              errors='replace') as fh:
+                        extra = '  ·  {} lignes'.format(
+                            sum(1 for _ in fh.readlines()[:2000]))
+                except OSError:
+                    pass
+            if fk == 'zip':
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(single) as z:
+                        extra = '  ·  {} fichiers'.format(len(z.infolist()))
+                except Exception:
+                    pass
+            d.text((106, y2 + 2), (info + extra)[:40], font=F_T,
+                   fill=charte.DIM, anchor='lm')
+            if fk == 'image':
+                try:
+                    from PIL import Image as PILImage
+                    im = PILImage.open(single).convert('RGB')
+                    im.thumbnail((74, 56))
+                    img.paste(im, (236, yy + 14), charte.rounded(im, 6))
+                except Exception:
+                    pass
+            elif fk in ('video', 'audio'):
+                charte.ico_play(d, 296, yy + 40, 8, charte.GREEN)
+            elif fk == 'py':
+                charte.ico_code(d, 296, yy + 40, 8, charte.BLUE)
+        elif sel:
             d.text((106, yy + 8), 'SELECTION ({})'.format(len(sel)),
                    font=F_T, fill=charte.ORANGE, anchor='lm')
             import textwrap

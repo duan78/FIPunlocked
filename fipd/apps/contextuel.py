@@ -155,6 +155,8 @@ class ContextuelApp(App):
         self.tab_since = 0.0           # debut du contexte courant (duree)
         self.yt = {}                   # url youtube -> {'data', 'img'}
         self.fav = {}                  # host -> favicon PIL (ou None)
+        self._exp = {'t': 0.0, 'map': {}}   # hwnd -> (chemin, obj COM)
+        self._com_init = False
         self.scroll = 0
         self.exe = ''                 # chemin de l'exe au premier plan
         self.topmost = False
@@ -265,7 +267,84 @@ class ContextuelApp(App):
         repo = self._extract_repo(title)      # sans extension : par titre
         if repo:
             return 'github', repo, None
+        # ---- applications specifiques (fenetre au premier plan) ----
+        if self.proc == 'explorer.exe':
+            path = self._explorer_lookup()
+            if path is not None:
+                return 'explorer', path, None
+        elif self.proc == 'code.exe':
+            m = re.match(r'^(.*?)\s+-\s+(.*?)\s+-\s+Visual Studio Code\s*$',
+                         title)
+            if m:
+                return 'code', {'file': m.group(1), 'ws': m.group(2)}, None
+        elif self.proc in ('windowsterminal.exe', 'wt.exe'):
+            m = re.search(r'([A-Za-z]:\\[^\s:;|]+)', title)
+            return 'terminal', {'cwd': m.group(1) if m else None}, None
+        elif self.proc == 'vlc.exe':
+            m = re.match(r'^(.*?)\s+-\s+Lecteur multimédia VLC\s*$', title)
+            return 'vlc', {'name': (m.group(1) if m else title)}, None
         return 'app', None, None
+
+    # ---------- explorer : chemins reels via COM Shell.Application ----------
+
+    def _explorer_map(self):
+        """{hwnd: (chemin, objet navigateur)} — COM initialisé dans le thread."""
+        if not self._com_init:
+            try:
+                import comtypes
+                comtypes.CoInitialize()
+            except Exception:
+                pass
+            self._com_init = True
+        if time.time() - self._exp['t'] < 1.5:
+            return self._exp['map']
+        out = {}
+        try:
+            from comtypes.client import CreateObject
+            for w in CreateObject('Shell.Application').Windows():
+                try:
+                    hwnd = int(w.hwnd)
+                    loc = w.LocationURL or ''
+                    path = ''
+                    if loc.startswith('file:///'):
+                        from urllib.parse import unquote
+                        path = unquote(loc[8:]).replace('/', os.sep)
+                    if not path:
+                        path = w.Document.Folder.Self.Path
+                    if path and not path.startswith('::'):
+                        out[hwnd] = (path, w)
+                    else:
+                        name = w.Document.Folder.Self.Name or 'Dossier'
+                        out[hwnd] = (name, w)
+                except Exception:
+                    continue
+        except Exception as e:
+            print('[contexte] shell COM:', e, flush=True)
+        self._exp = {'t': time.time(), 'map': out}
+        return out
+
+    def _explorer_lookup(self):
+        """Chemin de la fenetre explorer au premier plan, ou None."""
+        try:
+            return self._explorer_map().get(self.hwnd, (None, None))[0]
+        except Exception:
+            return None
+
+    def _explorer_obj(self):
+        try:
+            return self._explorer_map().get(self.hwnd, (None, None))[1]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _unix_path(p):
+        """C:\\Users\\x -> /c/Users/x (git bash)."""
+        if not p:
+            return p
+        p = p.replace('\\', '/')
+        if len(p) >= 2 and p[1] == ':':
+            return '/' + p[0].lower() + p[2:]
+        return p
 
     def _yt_fetch(self, url):
         """Metadonnees + miniature YouTube via oEmbed (sans cle)."""
@@ -399,6 +478,106 @@ class ContextuelApp(App):
             elif n == 4:
                 clipboard_set(urlsplit(self.pl).netloc)
                 self.alert('domaine copie')
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'explorer' and self.pl:
+            path = self.pl
+            if n == 1:
+                clipboard_set(path)
+                self.alert('chemin copie')
+            elif n == 2:                       # terminal dans ce dossier
+                try:
+                    subprocess.Popen(['wt', '-d', path])
+                except FileNotFoundError:
+                    subprocess.Popen(['cmd', '/c', 'start', 'cmd', '/k',
+                                      'cd', '/d', path])
+                self.alert('terminal ouvert')
+            elif n == 3:
+                clipboard_set(self._unix_path(path))
+                self.alert('chemin unix copie')
+            elif n == 4:                       # remonter au dossier parent
+                parent = os.path.dirname(path.rstrip('\\/'))
+                if parent and parent != path:
+                    w = self._explorer_obj()
+                    done = False
+                    if w is not None:
+                        try:
+                            w.Navigate2(parent)
+                            done = True
+                        except Exception:
+                            pass
+                    if not done:
+                        os.startfile(parent)
+                    self.alert('dossier parent')
+                else:
+                    self.alert('deja a la racine')
+            elif n == 5:
+                clipboard_set(os.path.basename(path.rstrip('\\/')) or path)
+                self.alert('nom copie')
+            elif n == 6:                       # actualiser la fenetre
+                w = self._explorer_obj()
+                if w is not None:
+                    try:
+                        w.Refresh()
+                        self.alert('actualise')
+                    except Exception:
+                        self.alert('rafraichissement impossible')
+        elif self.kind == 'code' and isinstance(self.pl, dict):
+            import keysend
+            if n == 1:
+                clipboard_set(self.pl.get('file', ''))
+                self.alert('fichier copie')
+            elif n == 2:
+                clipboard_set(self.pl.get('ws', ''))
+                self.alert('workspace copie')
+            elif n == 3:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                (self.pl.get('file', '') + ' '
+                                 + os.path.splitext(
+                                     self.pl.get('file', ''))[1])
+                                .strip().replace(' ', '+'))
+            elif n == 4 and self.hwnd:         # toujours devant
+                on = not self.topmost
+                if u32.SetWindowPos(self.hwnd, wt.HWND(-1 if on else -2),
+                                     0, 0, 0, 0, SWP_NOMOVE_NOSIZE):
+                    self.topmost = on
+                    self.alert('toujours devant: ' + ('OUI' if on else 'NON'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'terminal' and isinstance(self.pl, dict):
+            import keysend
+            cwd = self.pl.get('cwd')
+            if n == 1 and cwd:
+                clipboard_set(cwd)
+                self.alert('chemin copie')
+            elif n == 2 and cwd:
+                os.startfile(cwd)
+                self.alert('explorateur ouvert')
+            elif n == 3 and cwd:
+                clipboard_set(self._unix_path(cwd))
+                self.alert('chemin unix copie')
+            elif n == 4:
+                webbrowser.open('https://www.google.com/search?q=' +
+                                self.wtitle.replace(' ', '+'))
+            elif n == 5:
+                keysend.tap('volumedown')
+            elif n == 6:
+                keysend.tap('volumeup')
+        elif self.kind == 'vlc':
+            import keysend
+            if n == 1:
+                keysend.tap('space')
+            elif n == 2:
+                keysend.tap('s')
+            elif n == 3:
+                clipboard_set((self.pl or {}).get('name', ''))
+                self.alert('titre copie')
+            elif n == 4:
+                keysend.tap('m')
             elif n == 5:
                 keysend.tap('volumedown')
             elif n == 6:
@@ -553,6 +732,14 @@ class ContextuelApp(App):
             self._rg_youtube(img, d)
         elif self.kind == 'site':
             self._rg_site(img, d)
+        elif self.kind == 'explorer':
+            self._rg_explorer(img, d)
+        elif self.kind == 'code':
+            self._rg_code(img, d)
+        elif self.kind == 'terminal':
+            self._rg_terminal(img, d)
+        elif self.kind == 'vlc':
+            self._rg_vlc(img, d)
         else:
             self._rg_default(img, d)
 
@@ -795,6 +982,178 @@ class ContextuelApp(App):
         d.text((106, 210), path, font=F_T, fill=(110, 118, 129), anchor='lm')
         d.text((106, 226), 'fenetre: ' + self.proc, font=F_T,
                fill=(90, 95, 110), anchor='lm')
+
+    def _rg_explorer(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        path = self.pl or '?'
+        is_dir = os.path.isdir(path)
+        name = os.path.basename(path.rstrip('\\/')) or path
+        caps = [
+            (charte.ico_copy, 'Chemin', '', None, False),
+            (charte.ico_terminal, 'Terminal', '', None, False),
+            (charte.ico_copy, 'Unix', '', None, False),
+            (charte.ico_folder, 'Parent', '', None, False),
+            (charte.ico_copy, 'Nom', '', None, False),
+            (charte.ico_clock, 'MAJ', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'EXPL', charte.ORANGE)
+        d.rounded_rectangle((106, 12, 146, 52), radius=8, fill=(60, 44, 16),
+                            outline=charte.ORANGE)
+        charte.ico_folder(d, 126, 32, 13, charte.ORANGE)
+        nm = name
+        while nm and d.textlength(nm, font=F_S) > 155:
+            nm = nm[:-1]
+        d.text((152, 24), nm, font=F_S, fill=charte.FG, anchor='lm')
+        parent = os.path.dirname(path.rstrip('\\/')) if is_dir else ''
+        d.text((152, 45), parent[:28], font=F_T, fill=charte.DIM, anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        d.text((106, 76), 'CHEMIN', font=F_T, fill=charte.DIM, anchor='lm')
+        import textwrap
+        yy = 94
+        for ln in textwrap.wrap(path, 38)[:3]:
+            d.text((106, yy), ln, font=F_XS, fill=(120, 160, 230),
+                   anchor='lm')
+            yy += 17
+        d.line((106, yy - 4, 313, yy - 4), fill=charte.BORDER)
+        # stats : nb elements + espace libre du disque
+        n_items = -1
+        if is_dir:
+            try:
+                n_items = sum(1 for _ in os.scandir(path)) 
+            except OSError:
+                n_items = -1
+        free = ''
+        try:
+            import shutil
+            du = shutil.disk_usage(path)
+            free = '{:.0f} Go libres'.format(du.free / 2**30)
+        except Exception:
+            pass
+        x = 106
+        if n_items >= 0:
+            x += charte.pill(d, x, yy + 14, charte.ico_window,
+                             str(n_items), charte.BLUE) + 8
+        if free:
+            charte.pill(d, x, yy + 14, charte.ico_check, free, charte.GREEN)
+
+    def _rg_code(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        pl = self.pl or {}
+        fname, ws = pl.get('file', '?'), pl.get('ws', '?')
+        caps = [
+            (charte.ico_copy, 'Fichier', '', None, False),
+            (charte.ico_copy, 'Workspace', '', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_pin, 'Devant', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'CODE', charte.BLUE)
+        d.rounded_rectangle((106, 12, 146, 52), radius=8, fill=(16, 30, 52),
+                            outline=charte.BLUE)
+        charte.ico_code(d, 126, 32, 12, charte.BLUE)
+        fn = fname
+        while fn and d.textlength(fn, font=F_S) > 155:
+            fn = fn[:-1]
+        d.text((152, 24), fn, font=F_S, fill=charte.FG, anchor='lm')
+        d.text((152, 45), ws[:28], font=F_T, fill=charte.DIM, anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        ext = os.path.splitext(fname)[1].lstrip('.').lower() or '?'
+        x = 106
+        x += charte.pill(d, x, 80, charte.ico_window, ext, charte.PURPLE) + 8
+        charte.pill(d, x, 80, charte.ico_clock, self._duree(), charte.DIM)
+        d.text((106, 110), 'EDITEUR', font=F_T, fill=charte.DIM, anchor='lm')
+        d.text((106, 128), 'Visual Studio Code', font=F_XS, fill=charte.FG,
+               anchor='lm')
+        d.text((106, 150), 'raccourcis clavier locaux ; molette gauche =',
+               font=F_T, fill=(90, 95, 110), anchor='lm')
+        d.text((106, 164), 'changer de page FIP', font=F_T,
+               fill=(90, 95, 110), anchor='lm')
+
+    def _rg_terminal(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        cwd = (self.pl or {}).get('cwd')
+        caps = [
+            (charte.ico_copy, 'Chemin', '' if cwd else 'n/a', None, False),
+            (charte.ico_folder, 'Ici', '' if cwd else 'n/a', None, False),
+            (charte.ico_copy, 'Unix', '' if cwd else 'n/a', None, False),
+            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'TERM', charte.GREEN)
+        d.rounded_rectangle((106, 12, 146, 52), radius=8, fill=(14, 34, 22),
+                            outline=charte.GREEN)
+        charte.ico_terminal(d, 126, 32, 12, charte.GREEN)
+        d.text((152, 24), 'Terminal', font=F_S, fill=charte.FG, anchor='lm')
+        d.text((152, 45), self.wtitle[:28], font=F_T, fill=charte.DIM,
+               anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        d.text((106, 76), 'REPERTOIRE', font=F_T, fill=charte.DIM,
+               anchor='lm')
+        if cwd:
+            import textwrap
+            yy = 94
+            for ln in textwrap.wrap(cwd, 38)[:3]:
+                d.text((106, yy), ln, font=F_XS, fill=(120, 160, 230),
+                       anchor='lm')
+                yy += 17
+        else:
+            d.text((106, 94), '(indetermine — le titre ne montre pas',
+                   font=F_XS, fill=charte.DIM, anchor='lm')
+            d.text((106, 111), 'pas de chemin)', font=F_XS, fill=charte.DIM,
+                   anchor='lm')
+
+    def _rg_vlc(self, img, d):
+        F_S = fipui.font(15)
+        F_XS = fipui.font(13)
+        F_T = fipui.font(11)
+        name = (self.pl or {}).get('name', '?')
+        caps = [
+            (charte.ico_play, 'Pause', '', None, False),
+            (charte.ico_x, 'Stop', '', None, False),
+            (charte.ico_copy, 'Titre', '', None, False),
+            (charte.ico_min, 'Muet', '', None, False),
+            (charte.ico_min, 'Vol-', '', None, False),
+            (charte.ico_min, 'Vol+', '', None, False),
+        ]
+        for i, (ic, lab, val, col, hot) in enumerate(caps):
+            charte.keycap(d, 4 + i * 39, lab, value=val, icon=ic, col=col,
+                          hot=hot, h=35, x0=4, x1=94, fsize=11, r=4)
+        charte.panel(d, (98, 4, 317, 238))
+        self._chip(d, 311, 10, 'VLC', charte.ORANGE)
+        av = charte.letter_avatar('vlc', 40, 9)
+        img.paste(av, (106, 10), charte.rounded(av, 9))
+        d.text((154, 24), 'VLC', font=F_S, fill=charte.FG, anchor='lm')
+        d.text((154, 45), 'lecteur multimedia', font=F_T, fill=charte.DIM,
+               anchor='lm')
+        d.line((106, 62, 313, 62), fill=charte.BORDER)
+        d.text((106, 76), 'EN COURS', font=F_T, fill=charte.DIM, anchor='lm')
+        import textwrap
+        yy = 96
+        for ln in textwrap.wrap(name, 34)[:4]:
+            d.text((106, yy), ln, font=F_XS, fill=charte.FG, anchor='lm')
+            yy += 17
+        d.text((106, yy + 10), 'raccourcis envoyes a la fenetre VLC',
+               font=F_T, fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):
         F_S = fipui.font(15)

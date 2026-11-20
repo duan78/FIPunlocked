@@ -187,6 +187,20 @@ def ico_window(d, cx, cy, r, col):
     d.line((cx - r, cy - r + 4, cx + r, cy - r + 4), fill=col, width=2)
 
 
+def ico_folder(d, cx, cy, r, col):
+    d.polygon([(cx - r, cy - r + 3), (cx - r + 2, cy - r), (cx - 2, cy - r),
+               (cx, cy - r + 3), (cx + r, cy - r + 3)], outline=col)
+    d.rounded_rectangle((cx - r, cy - r + 2, cx + r, cy + r), radius=2,
+                        outline=col, width=2)
+
+
+def ico_code(d, cx, cy, r, col):
+    d.line((cx - 2, cy - r + 1, cx - r + 2, cy), fill=col, width=2)
+    d.line((cx - 2, cy, cx - r + 2, cy + r - 1), fill=col, width=2)
+    d.line((cx + 2, cy - r + 1, cx + r - 2, cy), fill=col, width=2)
+    d.line((cx + 2, cy, cx + r - 2, cy + r - 1), fill=col, width=2)
+
+
 # ---------- avatars ----------
 
 def _hash_color(name):

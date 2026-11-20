@@ -87,7 +87,10 @@ pour exposer `/app/<name>`) :
   URL (copies, Google, domaine, volume) ; **app Windows** → fiches par
   application : **Explorateur** (chemin réel via COM Shell.Application,
   nb d'éléments, espace libre ; copier chemin / chemin unix / terminal ici
-  `wt -d` / parent Navigate2 / actualiser), **VS Code** (fichier + workspace),
+  `wt -d` / parent Navigate2 / actualiser ; **sélection suivie + actions par
+  type de fichier** : image → miniature + zoom plein écran, vidéo → lecture
+  sur l'écran du FIP, audio → ffplay, `.py` → exécution, `.zip` → contenu,
+  VS Code), **VS Code** (fichier + workspace),
   **Terminal** (cwd du titre), **VLC** (média, pause/stop/muet) ; sinon fiche
   générique (Copier titre/Toujours devant/Minimiser/Tuer 2×/Redémarrer 2×/
   Chemin exe). Onglets et URL via **UIA** (`uiatabs.py`), repli GitHub par

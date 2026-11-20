@@ -48,7 +48,10 @@ controller** for anything: system dashboard, news reader, custom pages, or plain
 # once, as admin: the official Logitech service (auto-start is set during install)
 sc start DirectOutputService
 
-pip install pillow psutil opencv-python   # opencv only for /video
+pip install pillow psutil opencv-python requests   # core
+# optional, for specific apps:
+pip install winrt-Windows.Media.Control   # LECTURE (Now Playing)
+# gh (GitHub CLI) for CI GITHUB · ffplay (ffmpeg) for RADIO
 cd fipd
 python fipd3.py                            # -> http://127.0.0.1:8199
 ```
@@ -73,6 +76,23 @@ the two page buttons between the knobs (firmware-driven, via a `PageChange`
 callback — with our 5 pages registered they cycle *our* pages instead of the
 stock Saitek screens). The reader scrolls only when the right knob has no
 binding configured.
+
+## 🧩 The seven hot-loaded apps (`fipd/apps/`)
+
+| App | What it does |
+|---|---|
+| **CONTEXTE** | Chameleon page following the **active window**. GitHub repo tab → repo card (owner avatar, stars/issues/PR pills, run dots, open PR, description) + S1–S6 = Issues/PRs/Actions/Repo/copy URL/copy clone cmd. Any window → copy title, always-on-top, minimize, kill (2×), restart (2×), copy exe path. Layout 30/70: keycaps left (aligned with the buttons), info right |
+| **DECK** | Generic JSON button pages (`apps/deck.json`, hot-reloaded): `key` / `url` / `http` / `run` / `alert` actions — a Stream-Deck in a config file |
+| **LECTURE** | Now Playing: SMTC (Spotify, browsers…) with album art, or VLC via its Web interface (`activer_vlc_web.bat`, one click). S1 pause, S2/S3 track, S4 source, S5/S6 volume, right knob = ±10 s seek |
+| **CI GITHUB** | GitHub Actions dashboard of your repos (`gh`, auto-seeded), green/red run dots, button opens the run, alert on CI failure |
+| **TACHES** | Task manager: top-6 processes (CPU/RAM/DISK sort on the right knob), kill on double-press, system processes protected |
+| **CAMERAS** | MJPEG/RTSP streams full-screen (~5 fps), list on S1–S6, right knob cycles; streams added remotely via `POST /app/cameras` |
+| **RADIO** | Web radio: catalog auto-fetched from radio-browser.info (12 FR stations), ffplay audio, live ICY track title, right knob = tuner, S1–S6 = presets |
+
+Apps are plain `fipui.App` subclasses (any `name != 'app'`, not `abstract`);
+optional `render_full(img)` for pixel-level rendering (album art, video) and
+optional `http_get`/`http_post` expose `GET/POST /app/<name>`. Reload the
+whole directory at runtime with `POST /apps/reload`.
 
 ## ⌨️ Keyboard bindings (Stream-Deck mode, opt-in)
 
@@ -101,6 +121,9 @@ curl -X POST -d '{"paging": true,
 | `GET /events` | Last 50 events (JSON) |
 | `GET/POST /bindings` | Read / update keyboard bindings |
 | `POST /led` `{"index":1..8,"on":true}` | Control a LED (`{"scan":true}` to cycle) |
+| `GET /apps` · `POST /page {"page":N}` | List pages / switch page |
+| `POST /apps/reload` | Re-scan `fipd/apps/` (hot-load, shared modules included) |
+| `GET/POST /app/<name>` | Per-app endpoint (e.g. `/app/webradio`, `/app/cameras`) |
 | `GET /keys` | Recognized key names |
 | `GET /` | Status page |
 
@@ -169,8 +192,12 @@ states are per firmware page. Button-press lighting can be disabled with
 - [x] **FIP-native app framework** (`fipui`) — shipped Nov 2026: apps combine
       display, buttons, knobs, persistent LEDs and alerts; 7 built-in pages
       including a scrollable settings menu and the REFLEX mini-game
-- [ ] FIP apps: load third-party apps from an `apps/` directory (hot-load),
-      more widgets (sliders, spinners, charts)
+- [x] **Third-party app hot-loading** (`apps/`, `POST /apps/reload`) + shared
+      design system (`charte.py`) — shipped Nov 20, 2026 with 7 apps
+- [x] **Contextual page** (active window / GitHub tab) — shipped Nov 20, 2026
+- [ ] **All open windows + all Chrome tabs** on the panel (Chrome extension
+      in `fipd/extension_fip/` — pushes tabs to the daemon, executes commands
+      back: activate/close/reload/pin)
 - [ ] Capture the exact wire bytes of the page-activation sequence → pure-Python
       `firmware_init()` (drop the Logitech stack entirely)
 - [ ] **Linux port** — libusb for the bulk interface (44-byte big-endian header
@@ -180,6 +207,12 @@ states are per firmware page. Button-press lighting can be disabled with
 
 - [`fipd/`](fipd) — the HTTP daemon (`fipd3.py`) + pure-Python protocol driver
   (`fip.py`) + test clients, Frida captures, `gen_screens.py` (doc screenshots)
+- [`fipd/apps/`](fipd/apps) — the 7 hot-loaded apps (deck, nowplaying, githubci,
+  taskmgr, cameras, webradio, contexte) + per-app JSON configs (auto-created)
+- [`fipd/charte.py`](fipd/charte.py) — shared design system (palette, cards,
+  keycaps, icons, avatars)
+- [`fipd/extension_fip/`](fipd/extension_fip) — Chrome extension: pushes the
+  tab list to the daemon and runs its commands (activate/close/reload/pin)
 - [`proxy/`](proxy) — gcc source of the x64 proxy DLL + deploy/restore script
 - [`disas_*.py`](.) — targeted disassembly tooling
 - [`cecil/`](cecil) — Mono.Cecil IL dump scripts

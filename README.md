@@ -32,9 +32,11 @@ controller** for anything: system dashboard, news reader, custom pages, or plain
   a GitHub repo tab becomes a live repo card (stars/issues/PRs/runs + owner
   avatar, via `gh`) with one-press actions; any other window gets window
   actions (always-on-top, kill, restart, copy exe path…)
-- 🎮 **REFLEX mini-game** — whack-a-mole across the 6 rows with LED mirroring,
-  speed bonus, lives, level control on both knobs
-- 📑 **14 pages** (7 built-in + 7 apps) — left knob cycles, see below
+- 🎮 **DOOM on the FIP** — a from-scratch raycasting engine (160 rays, textured
+  walls, sprite billboard clipping, shotgun, imps & demons, medikits, waves):
+  left knob turns, right knob steps forward/back, S1 fires, S2/S3 strafe,
+  S6 autorun; LEDs 1–6 mirror health
+- 📑 **15 pages** (6 built-in + 9 apps) — left knob cycles, see below
 - ⌨️ **Opt-in keyboard bindings** — map `ctrl+shift+s`, `volumemute`, `win+d`…
   on any control. *Default: controls act only on the FIP's own pages, nothing
   runs on the host.*
@@ -56,10 +58,10 @@ cd fipd
 python fipd3.py                            # -> http://127.0.0.1:8199
 ```
 
-## 📑 The seven built-in pages
+## 📑 The six built-in pages
 
-![FIP pages](docs/pages.png) *(core pages — the `apps/` directory adds 7 more,
-hot-loaded)*
+![FIP pages](docs/pages.png) *(6 core pages + 3 app highlights — the `apps/`
+directory holds 9 more, hot-loaded)*
 
 | Page | Content |
 |---|---|
@@ -69,7 +71,6 @@ hot-loaded)*
 | **4 · Button tester** | S1–S6 light up on press, knobs & select states — instant feedback |
 | **5 · Reader** | Long text scrolled by the **right knob** (44 px/notch) with progress bar |
 | **6 · fipui demo** | Scrollable menu (8 items, 6 visible × 40 px aligned with the buttons): right knob scrolls, S1–S6 and LEDs act on the **visible** rows, action items fire alerts |
-| **7 · REFLEX** | Mini whack-a-mole game: moles pop in the 6 rows (LED mirrors), S1–S6 to whack — any button starts/replays, knobs adjust the level (the left knob is captured by the game on this page only — the two middle buttons keep paginating) |
 
 Navigation is **bounded** (no wrap-around) and works from BOTH the left knob and
 the two page buttons between the knobs (firmware-driven, via a `PageChange`
@@ -77,10 +78,11 @@ callback — with our 5 pages registered they cycle *our* pages instead of the
 stock Saitek screens). The reader scrolls only when the right knob has no
 binding configured.
 
-## 🧩 The seven hot-loaded apps (`fipd/apps/`)
+## 🧩 The nine hot-loaded apps (`fipd/apps/`)
 
 | App | What it does |
 |---|---|
+| **DOOM** | Raycasting FPS written from scratch: 160 rays, distance/side shading + brick joints, billboard sprites clipped against the z-buffer, shotgun with muzzle flash & recoil, pain flash, pixel-art HUD face, medikits/ammo pickups, endless waves (level = +demons, +speed, +25 HP, +10 shells). Left knob turns (captured by the game on this page only — the two middle buttons keep paginating), right knob steps forward/back, S1 fires, S2/S3 strafe, S6 toggles autorun, LEDs 1–6 = health |
 | **CONTEXTE** | Chameleon page following the **active window**. GitHub repo tab → repo card (owner avatar, stars/issues/PR pills, run dots, open PR, description) + S1–S6 = Issues/PRs/Actions/Repo/copy URL/copy clone cmd. Any window → copy title, always-on-top, minimize, kill (2×), restart (2×), copy exe path. Layout 30/70: keycaps left (aligned with the buttons), info right |
 | **DECK** | Generic JSON button pages (`apps/deck.json`, hot-reloaded): `key` / `url` / `http` / `run` / `alert` actions — a Stream-Deck in a config file |
 | **LECTURE** | Now Playing: SMTC (Spotify, browsers…) with album art, or VLC via its Web interface (`activer_vlc_web.bat`, one click). S1 pause, S2/S3 track, S4 source, S5/S6 volume, right knob = ±10 s seek |
@@ -176,7 +178,7 @@ class MyApp(fipui.App):
 The daemon handles everything hardware: current-page rule, single display
 thread (no RPC re-entrancy), keepalive, paging, keyboard bindings (an app
 yields a control when it's bound). Apps can also `capture_left_knob = True`
-to own the left knob on their page (like the REFLEX game). `GET /apps` lists pages, `POST /page
+to own the left knob on their page (like the DOOM game). `GET /apps` lists pages, `POST /page
 {"page":N}` switches.
 
 ## 💡 LEDs
@@ -190,8 +192,12 @@ states are per firmware page. Button-press lighting can be disabled with
 ## 🗺️ Roadmap
 
 - [x] **FIP-native app framework** (`fipui`) — shipped Nov 2026: apps combine
-      display, buttons, knobs, persistent LEDs and alerts; 7 built-in pages
-      including a scrollable settings menu and the REFLEX mini-game
+      display, buttons, knobs, persistent LEDs and alerts; 6 built-in pages
+      including a scrollable settings menu
+- [x] **DOOM on the FIP** (`apps/doom.py`) — shipped Nov 22, 2026: a from-scratch
+      raycasting engine (DDA, z-buffer-clipped billboard sprites, pixel-art
+      sprites/HUD face, hitscan shotgun, imps' fireballs, charging demons,
+      medikits/ammo, endless waves) at ~12 fps over the stock driver stack
 - [x] **Third-party app hot-loading** (`apps/`, `POST /apps/reload`) + shared
       design system (`charte.py`) — shipped Nov 20, 2026 with 7 apps
 - [x] **Contextual page** (active window / GitHub tab) — shipped Nov 20, 2026

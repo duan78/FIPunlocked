@@ -55,16 +55,17 @@ select=0x01, R_CW/CCW=0x02/0x04, L_CW/CCW=0x10/0x08 (confirmés matériel 19/11)
   `ext\Saitek.FIP.dll` (UI WPF) + device raw dans SPAD.neXt.Devices.dll (obfusqué).
   SPAD streame des images rendues côté hôte (pas de serveur embarqué).
 
-## Applications fipui — 13 pages (20/11 soir)
+## Applications fipui — 15 pages (22/11)
 **Intégrées** : Horloge, Systeme, Reseau, TEST boutons, JOURNAL (lecture
-molette droite), DEMO FIPUI (liste défilante viewport-relative) et REFLEX
-(mini-jeu taupes). NB : le FIP n'a PAS de bouton select physique (0x01).
+molette droite), DEMO FIPUI (liste défilante viewport-relative). NB : le FIP
+n'a PAS de bouton select physique (0x01). (REFLEX, mini-jeu taupes d'origine,
+a été remplacé par DOOM le 22/11.)
 
 **Apps tierces** (`apps/*.py`, chargées au démarrage + `POST /apps/reload`
 à chaud ; une classe `fipui.App` avec `name` != 'app' et pas `abstract` ;
 option `render_full(img)` pour coller des images ; option `http_get/http_post`
 pour exposer `/app/<name>`) :
-- - **FENETRES** — toutes les **fenêtres ouvertes** (EnumWindows : z-order,
+- **FENETRES** — toutes les **fenêtres ouvertes** (EnumWindows : z-order,
   processus, états premier plan/minimisée/toujours devant) + tous les
   **onglets Chrome/Edge** via **UI Automation** (`uiatabs.py`, aucune
   installation ni extension). Layout 30/70 : keycaps contextuels de l'entrée
@@ -108,6 +109,13 @@ pour exposer `/app/<name>`) :
   titre sans UIA. `GET /app/contexte` = contexte courant. Rendu **charte
   graphique** (`charte.py` : palette GitHub Dark, `panel`/`keycap`/`pill`/
   `ico_*`/`letter_avatar`/`ago` — réutilisable par toutes les apps).
+- **DOOM** 🆕 — FPS raycasting maison (160 rayons, murs ombrés par
+  distance/face + joints de briques, sprites billboard clippés contre le
+  z-buffer, fusil a pompe avec flash et recul, medikits/munitions, vagues
+  sans fin : niveau = +démons, +vitesse, +25 PV, +10 cartouches). Molette
+  gauche = tourner (capturée sur cette page), molette droite =
+  avancer/reculer, S1 = tirer, S2/S3 = pas de côté, S6 = marche auto,
+  LEDs 1-6 = santé.
 - **CAMERAS** — flux vidéo MJPEG/RTSP plein écran, liste sur S1-S6, molette
   droite = caméra suivante ; flux ajoutés via `POST /app/cameras`
   (`apps/cameras.json`)

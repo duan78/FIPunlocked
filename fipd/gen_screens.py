@@ -1,9 +1,14 @@
 """
 gen_screens.py — Captures d'ecran du FIP pour la doc (docs/).
 Rend les pages du daemon (framework fipui) exactement comme envoyees au device.
-Genere : docs/pageN.png (x6), docs/pages.png (grille 3x2), docs/hero.png (mockup).
+Genere : docs/pageN.png (x9), docs/pages.png (grille 3x3), docs/hero.png (mockup).
+
+La capture CONTEXTE suit l'onglet actif du navigateur : ouvrir un onglet
+github.com/<user>/<repo> avant de lancer le script pour la carte repo.
 """
+import math
 import os
+import time
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -34,19 +39,28 @@ demo = D.apps[5]
 demo.view = 1                                     # demo : liste defilante (items 2-7)
 demo.states = {0: True, 1: False, 2: True, 3: False, 4: True, 6: True}
 
-game = D.apps[6]                                     # jeu : partie en cours
-game.state = 'run'; game.score = 87; game.lives = 2; game.level = 3
-game.best = 204; game.mole = (1, 0, 99)
+# doom : partie en cours, face a l'imp du nord qui vient de tirer
+doom = next(a for a in D.apps if a.name == 'doom')
+doom.state = 'play'
+doom.px, doom.py, doom.ang = 13.5, 2.5, math.pi
+doom.hp, doom.ammo, doom.kills = 74, 17, 3
+doom.hurt = doom.recoil = doom.muzzle = 0.0
+doom.fires = [{'x': 12.1, 'y': 2.5, 'dx': -1.0, 'dy': 0.0, 't': 3.0}]
 
+# laisser les threads de poll remplir leurs etats (contexte = onglet actif)
+time.sleep(6)
+
+PICK = ['clock', 'system', 'network', 'tester', 'reader', 'demo',
+        'doom', 'contexte', 'fenetres']
 labels = ['1 - Clock', '2 - System', '3 - Network', '4 - Button tester',
           '5 - Reader (right knob)', '6 - fipui demo (menu + LEDs)',
-          '7 - REFLEX (mini-game)']
-pages = [D.render_page(i) for i in range(len(D.apps))]
+          '7 - DOOM', '8 - CONTEXTE (GitHub tab)', '9 - FENETRES (windows + tabs)']
+by_name = {a.name: i for i, a in enumerate(D.apps)}
+pages = [D.render_page(by_name[n]) for n in PICK]
 for i, img in enumerate(pages, 1):
     img.save(os.path.join(OUT, f'page{i}.png'))
 
 # --- grille 3xN ---
-import math
 M, LBL = 18, 30
 rows = math.ceil(len(pages) / 3)
 W = 3 * 320 + 4 * M

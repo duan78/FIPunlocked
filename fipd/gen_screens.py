@@ -17,7 +17,9 @@ import fipd3
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'docs')
 os.makedirs(OUT, exist_ok=True)
 
-D = fipd3.D
+# Daemon SANS peripherique (aucune DLL chargee, aucune page envoyee) : les
+# apps tierces sont instanciees et leurs threads de fond tournent, c'est tout.
+D = fipd3.Daemon()
 
 
 def font(sz):
@@ -52,29 +54,27 @@ time.sleep(6)
 
 PICK = ['clock', 'system', 'network', 'tester', 'reader', 'demo',
         'doom', 'contexte', 'fenetres']
-labels = ['1 - Clock', '2 - System', '3 - Network', '4 - Button tester',
-          '5 - Reader (right knob)', '6 - fipui demo (menu + LEDs)',
-          '7 - DOOM', '8 - CONTEXTE (GitHub tab)', '9 - FENETRES (windows + tabs)']
 by_name = {a.name: i for i, a in enumerate(D.apps)}
 pages = [D.render_page(by_name[n]) for n in PICK]
 for i, img in enumerate(pages, 1):
     img.save(os.path.join(OUT, f'page{i}.png'))
 
-# --- grille 3xN ---
+# --- grille 3xN : chaque libelle porte le VRAI numero de page du daemon ---
 M, LBL = 18, 30
 rows = math.ceil(len(pages) / 3)
 W = 3 * 320 + 4 * M
 H = rows * 240 + rows * LBL + (rows + 1) * M
 grid = Image.new('RGB', (W, H), (13, 17, 23))
 d = ImageDraw.Draw(grid)
-for i, (img, lab) in enumerate(zip(pages, labels)):
+for i, img in enumerate(pages):
     r, c = divmod(i, 3)
     x = M + c * (320 + M)
     y = M + r * (240 + LBL + M)
     grid.paste(img, (x, y))
     d.rectangle((x - 1, y - 1, x + 320, y + 240), outline=(45, 52, 66))
-    d.text((x + 160, y + 240 + LBL // 2), lab, font=F_LBL,
-           fill=(160, 170, 190), anchor='mm')
+    d.text((x + 160, y + 240 + LBL // 2),
+           'page %d - %s' % (by_name[PICK[i]] + 1, D.apps[by_name[PICK[i]]].title),
+           font=F_LBL, fill=(160, 170, 190), anchor='mm')
 grid.save(os.path.join(OUT, 'pages.png'))
 
 # --- mockup device (hero) : ecran = horloge, S3 allume + LED 3 verte ---

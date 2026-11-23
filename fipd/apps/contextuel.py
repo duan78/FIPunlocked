@@ -31,7 +31,8 @@ import fipui
 from fipui import App
 
 CREATE_NO_WINDOW = 0x08000000
-POLL_S = 0.4
+POLL_S = 0.4               # page affichée : le cameleon suit le premier plan
+IDLE_S = 1.0               # page masquée : même travail, cadence ralentie
 TTL_S = 45.0
 AV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'avatars')
 
@@ -66,48 +67,33 @@ GWL_EXSTYLE = -20
 WS_EX_TOPMOST = 0x0008
 SWP_NOMOVE_NOSIZE = 0x0003        # SWP_NOSIZE | SWP_NOMOVE
 
-K32 = ctypes.WinDLL('kernel32')
-K32.GlobalAlloc.restype = ctypes.c_void_p
-K32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
-K32.GlobalLock.restype = ctypes.c_void_p
-K32.GlobalLock.argtypes = [ctypes.c_void_p]
-K32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-K32.GlobalFree.restype = ctypes.c_void_p
-K32.GlobalFree.argtypes = [ctypes.c_void_p]
-u32.OpenClipboard.argtypes = [wt.HWND]
-u32.OpenClipboard.restype = wt.BOOL
-u32.CloseClipboard.restype = wt.BOOL
-u32.EmptyClipboard.restype = wt.BOOL
-u32.SetClipboardData.argtypes = [wt.UINT, ctypes.c_void_p]
-u32.SetClipboardData.restype = wt.HANDLE
-
-CF_UNICODETEXT = 13
-GMEM_MOVEABLE = 2
 SW_MINIMIZE = 6
 
 PROTECTED = {'explorer.exe', 'python.exe', 'pythonw.exe', 'dwm.exe',
              'svchost.exe', 'csrss.exe', 'lsass.exe', 'services.exe'}
+INVALID_TTL_S = 120.0       # echec reseau (gh, DNS) sur un depot : re-essai apres 2 min
+WIKI_SUFFIX = {
+    'fr': re.compile(r'\s+[-\u2013\u2014]\s*wikip[ée]dia\s*$', re.I),
+    'en': re.compile(r'\s+[-\u2013\u2014]\s*wikipedia\s*$', re.I),
+}
 
 
-def clipboard_set(text):
-    """Presse-papiers via ctypes (aucune dependance)."""
-    if not u32.OpenClipboard(None):
-        return False
+def safe_urlsplit(url):
+    """urlsplit qui ne leve JAMAIS (URL IPv6 incomplete, caracteres interdits
+    dans le netloc...) : renvoie un resultat au netloc vide."""
     try:
-        u32.EmptyClipboard()
-        data = text.encode('utf-16-le') + b'\x00\x00'
-        h = K32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-        if not h:
-            return False
-        p = K32.GlobalLock(h)
-        ctypes.memmove(p, data, len(data))
-        K32.GlobalUnlock(h)
-        ok = u32.SetClipboardData(CF_UNICODETEXT, h)
-        if not ok:
-            K32.GlobalFree(h)
-        return bool(ok)
-    finally:
-        u32.CloseClipboard()
+        return urlsplit(url or '')
+    except ValueError:
+        from urllib.parse import SplitResult
+        return SplitResult('', '', '', '', '')
+
+
+def _not_found(e):
+    """L'erreur gh designe-t-elle un depot inexistant (definitif) ?"""
+    return bool(re.search(r'404|Not Found|could not resolve', str(e), re.I))
+
+
+clipboard_set = fipui.clipboard_set     # ctypes, avec nouvelle tentative
 
 
 def foreground():
@@ -147,7 +133,7 @@ class ContextuelApp(App):
         self.hwnd, self.pid = 0, 0
         self.repo = None               # 'owner/nom' si onglet GitHub valide
         self.pending = None            # candidate en cours de validation
-        self.invalid = set()           # candidats rejetes par gh
+        self.invalid = {}              # repo -> date d'invalidation (None = definitive)
         self.cache = {}                # repo -> {'t', 'data', 'prs', 'runs'}
         self.tab = None                # onglet actif (UIA)
         self.kind = 'app'              # github | youtube | site | app
@@ -177,117 +163,157 @@ class ContextuelApp(App):
         self.exe = ''                 # chemin de l'exe au premier plan
         self.topmost = False
         self.rect = None              # (w, h) de la fenetre
-        self._armed = None            # ('kill'|'restart', t0) double appui
+        self._armed = None            # ('kill'|'restart', pid, t0) : double appui
+        self._armed_exec = None       # (chemin .py, t0) : 2x avant d'executer
         self._busy = threading.Lock()
         self._stop = threading.Event()
-        threading.Thread(target=self._watch, daemon=True).start()
-        threading.Thread(target=self._fetcher, daemon=True).start()
+        self._wake = threading.Event()     # on_enter : passage immediat
+        threading.Thread(target=self._watch, daemon=True, name='contexte-watch').start()
+        threading.Thread(target=self._fetcher, daemon=True,
+                         name='contexte-fetcher').start()
 
     # ---------- surveillance de la fenetre active ----------
 
     def _watch(self):
-        last = None
+        """Boucle de surveillance. Chaque passage est ISOLE : une exception ici
+        (URL malformee dans la barre d'adresse, COM capricieux...) ne doit JAMAIS
+        tuer le thread — sinon le cameleon reste fige jusqu'au reload.
+        Cadence : POLL_S page affichée ; IDLE_S page masquée (le cameleon
+        continue de suivre et de pre-charger, pour rester instantané à l'arrivée)
+        — on_enter() reveille la boucle pour un passage immediat."""
+        err_t = 0.0
         while not self._stop.is_set():
-            proc, title, hwnd, pid = foreground()
-            self.proc, self.wtitle = proc, title
-            self.hwnd, self.pid = hwnd, pid
-            if hwnd:
-                try:
-                    self.topmost = bool(u32.GetWindowLongW(
-                        hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
-                except Exception:
-                    pass
-                rc = RECT()
-                if u32.GetWindowRect(hwnd, ctypes.byref(rc)):
-                    self.rect = (rc.right - rc.left, rc.bottom - rc.top)
-                try:
-                    import psutil
-                    self.exe = psutil.Process(pid).exe()
-                except Exception:
-                    self.exe = ''
-            kind, pl, self.tab = self._classify(title)
-            self.kind, self.pl = kind, pl
-            tt = (self.tab or {}).get('title')
-            if tt != getattr(self, '_lt', None):
-                self._lt = tt
-                self._title_t = time.time()      # titre plus frais que l'URL ?
-            if pl != getattr(self, '_lu', None):
-                self._lu = pl
-                self._url_t = time.time()
-            repo = pl if kind == 'github' else None
-            if repo and repo in self.invalid:
-                repo = None
-            if kind == 'youtube' and pl and pl not in self.yt:
-                self._yt_fetch(pl)
-            if kind == 'site' and pl:
-                host = urlsplit(pl).netloc
-                if host and host not in self.fav:
-                    self._fav_fetch(host)
-                fk = 'page:' + pl[:120]
-                if pl not in self.pages and fk not in self._inflight:
-                    self._inflight.add(fk)
-                    threading.Thread(target=self._fetch_page,
-                                     args=(pl,), daemon=True).start()
-            if kind == 'ghpage' and isinstance(pl, dict):
-                key = (pl['repo'], pl['kind'], pl['n'])
-                c = self.ghd.get(key)
-                if (not c or time.time() - c['t'] > TTL_S) and \
-                        self._busy2.acquire(blocking=False):
-                    threading.Thread(target=self._fetch_ghpage,
-                                     args=(dict(pl),), daemon=True).start()
-            if kind == 'hf' and pl:
-                c = self.hfd.get(pl)
-                if (not c or time.time() - c['t'] > 60) and \
-                        self._busy2.acquire(blocking=False):
-                    threading.Thread(target=self._fetch_hf, args=(pl,),
-                                     daemon=True).start()
-            if kind == 'gsearch' and pl is not None:
-                q = self._gq()
-                fk = 'ddg:' + q
-                if q and fk not in self._inflight and (
-                        q not in self.ddg
-                        or time.time() - self.ddg[q]['t'] > 120):
-                    self._inflight.add(fk)
-                    threading.Thread(target=self._fetch_ddg, args=(q,),
-                                     daemon=True).start()
-            if kind == 'wiki' and isinstance(pl, dict):
-                key = (pl['lang'], pl['title'])
-                fk = 'wiki:{}:{}'.format(*key)
-                if fk not in self._inflight and (
-                        key not in self.wiki
-                        or time.time() - self.wiki[key]['t'] > 300):
-                    self._inflight.add(fk)
-                    threading.Thread(target=self._fetch_wiki, args=(dict(pl),),
-                                     daemon=True).start()
-            if kind == 'gsc':
-                k = pl or title[:80]
-                if (self.gsc is None or self.gsc.get('k') != k) \
-                        and 'gsc' not in self._inflight:
-                    self._inflight.add('gsc')
-                    threading.Thread(target=self._fetch_gsc, args=(k,),
-                                     daemon=True).start()
-            if kind == 'ediseo':
-                if (self.ediseo is None or time.time() - self.ediseo['t'] > 30) \
-                        and 'ediseo' not in self._inflight:
-                    self._inflight.add('ediseo')
-                    threading.Thread(target=self._fetch_ediseo,
-                                     daemon=True).start()
-            if kind == 'explorer':
-                self.exp_sel = self._explorer_sel()
-            changed = (repo, kind, pl, proc, title[:60]) != last
-            if pl != getattr(self, '_last_pl', None):
-                self._last_pl = pl
-                self.tab_since = time.time()      # nouveau contexte = chrono
-            if repo != self.repo:
-                self.repo = repo
-                self.scroll = 0
-                if repo and repo not in self.cache:
-                    self.pending = repo
-                changed = True
-            if changed:
-                last = (repo, kind, pl, proc, title[:60])
-                self.d._redraw_now()
-            self._stop.wait(POLL_S)
+            self._wake.clear()
+            try:
+                self._watch_once()
+            except Exception:
+                if time.time() - err_t > 10:
+                    err_t = time.time()
+                    import traceback
+                    traceback.print_exc()
+            self._wake.wait(POLL_S if self._shown.is_set() else IDLE_S)
+
+    def _watch_once(self):
+        """Un passage : fenetre active -> contexte -> fetchs a declencher."""
+        last = getattr(self, '_last_ctx', None)
+        proc, title, hwnd, pid = foreground()
+        self.proc, self.wtitle = proc, title
+        self.hwnd, self.pid = hwnd, pid
+        if hwnd:
+            try:
+                self.topmost = bool(u32.GetWindowLongW(
+                    hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+            except Exception:
+                pass
+            rc = RECT()
+            if u32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                self.rect = (rc.right - rc.left, rc.bottom - rc.top)
+            try:
+                import psutil
+                self.exe = psutil.Process(pid).exe()
+            except Exception:
+                self.exe = ''
+        kind, pl, self.tab = self._classify(title)
+        self.kind, self.pl = kind, pl
+        tt = (self.tab or {}).get('title')
+        if tt != getattr(self, '_lt', None):
+            self._lt = tt
+            self._title_t = time.time()      # titre plus frais que l'URL ?
+        if pl != getattr(self, '_lu', None):
+            self._lu = pl
+            self._url_t = time.time()
+        repo = pl if kind == 'github' else None
+        if repo and self._is_invalid(repo):
+            repo = None
+        if kind == 'youtube' and pl and pl not in self.yt:
+            self.yt[pl] = {'data': None, 'img': None}       # reserve tout de suite
+            threading.Thread(target=self._yt_fetch, args=(pl,), daemon=True).start()
+        if kind == 'site' and pl:
+            host = safe_urlsplit(pl).netloc
+            if host and host not in self.fav:
+                self.fav[host] = None                       # reserve tout de suite
+                threading.Thread(target=self._fav_fetch, args=(host,),
+                                 daemon=True).start()
+            fk = 'page:' + pl[:120]
+            pg = self.pages.get(pl)
+            stale = bool(pg and pg.get('err') and time.time() - pg['t'] > 30)
+            if (pl not in self.pages or stale) and fk not in self._inflight:
+                self._inflight.add(fk)
+                threading.Thread(target=self._fetch_page,
+                                 args=(pl,), daemon=True).start()
+        if kind == 'ghpage' and isinstance(pl, dict):
+            key = (pl['repo'], pl['kind'], pl['n'])
+            c = self.ghd.get(key)
+            if (not c or time.time() - c['t'] > TTL_S) and \
+                    self._busy2.acquire(blocking=False):
+                threading.Thread(target=self._fetch_ghpage,
+                                 args=(dict(pl),), daemon=True).start()
+        if kind == 'hf' and pl:
+            c = self.hfd.get(pl)
+            if (not c or time.time() - c['t'] > 60) and \
+                    self._busy2.acquire(blocking=False):
+                threading.Thread(target=self._fetch_hf, args=(pl,),
+                                 daemon=True).start()
+        if kind == 'gsearch' and pl is not None:
+            q = self._gq()
+            fk = 'ddg:' + q
+            if q and fk not in self._inflight and (
+                    q not in self.ddg
+                    or time.time() - self.ddg[q]['t'] > 120):
+                self._inflight.add(fk)
+                threading.Thread(target=self._fetch_ddg, args=(q,),
+                                 daemon=True).start()
+        if kind == 'wiki' and isinstance(pl, dict):
+            key = (pl['lang'], pl['title'])
+            fk = 'wiki:{}:{}'.format(*key)
+            if fk not in self._inflight and (
+                    key not in self.wiki
+                    or time.time() - self.wiki[key]['t'] > 300):
+                self._inflight.add(fk)
+                threading.Thread(target=self._fetch_wiki, args=(dict(pl),),
+                                 daemon=True).start()
+        if kind == 'gsc':
+            k = pl or title[:80]
+            if (self.gsc is None or self.gsc.get('k') != k) \
+                    and 'gsc' not in self._inflight:
+                self._inflight.add('gsc')
+                threading.Thread(target=self._fetch_gsc, args=(k,),
+                                 daemon=True).start()
+        if kind == 'ediseo':
+            # lecture UNE fois par page (pas de rafraichissement automatique) ;
+            # S4 = Relire. Autre page (autre filtre) = nouvelle lecture.
+            if (self.ediseo is None or self.ediseo.get('k') != pl) \
+                    and 'ediseo' not in self._inflight:
+                self._inflight.add('ediseo')
+                threading.Thread(target=self._fetch_ediseo, args=(pl or '',),
+                                 daemon=True).start()
+        if kind == 'explorer':
+            self.exp_sel = self._explorer_sel()
+        changed = (repo, kind, pl, proc, title[:60]) != last
+        if pl != getattr(self, '_last_pl', None):
+            self._last_pl = pl
+            self.tab_since = time.time()      # nouveau contexte = chrono
+            self.scroll = 0                   # ... et defilement remis au debut
+        if repo != self.repo:
+            self.repo = repo
+            self.scroll = 0
+            if repo and repo not in self.cache:
+                self.pending = repo
+            changed = True
+        if changed:
+            self._last_ctx = (repo, kind, pl, proc, title[:60])
+            self.d._redraw_now()
+
+    def _is_invalid(self, repo):
+        """Depot ecarte : definitivement (404) ou temporairement (gh/reseau en
+        panne) — dans ce cas on reessaie au bout de INVALID_TTL_S."""
+        t = self.invalid.get(repo, 0)
+        if t is None:
+            return True
+        if t and time.time() - t < INVALID_TTL_S:
+            return True
+        self.invalid.pop(repo, None)
+        return False
 
     @staticmethod
     def _extract_repo(title):
@@ -304,7 +330,8 @@ class ContextuelApp(App):
     def _fg_tab(self):
         """Onglet actif de la fenetre navigateur au premier plan, via UIA
         (uiatabs.py — sans extension) : {'title','url','hwnd'} ou None."""
-        if self.proc not in ('chrome.exe', 'msedge.exe') or not self.hwnd:
+        import uiatabs
+        if self.proc not in uiatabs.BROWSERS or not self.hwnd:
             return None
         import uiatabs
         try:
@@ -320,13 +347,13 @@ class ContextuelApp(App):
         app+None. L'URL de l'onglet (extension) prime sur le titre."""
         tab = self._fg_tab()
         if tab is not None:
+            import uiatabs
             # titre FRAIS : celui de la fenêtre Win32 (instantané), pas
             # celui du snapshot UIA (jusqu'à 0,35 s de retard)
-            if self.proc in ('chrome.exe', 'msedge.exe') and self.wtitle:
-                for suf in (' - Google Chrome', ' - Microsoft Edge'):
-                    if self.wtitle.endswith(suf):
-                        tab['title'] = self.wtitle[:-len(suf)]
-                        break
+            if self.wtitle:                 # Edge ecrit son nom avec un tiret mou
+                fresh = uiatabs.strip_suffix(self.wtitle)
+                if fresh != self.wtitle:
+                    tab['title'] = fresh
             url = tab.get('url') or ''
             # --- TITRE D'ABORD : le titre UIA est immediat alors que l'URL
             # de la barre d'adresse peut trainer 3-4 s apres une bascule
@@ -335,7 +362,8 @@ class ContextuelApp(App):
             bl = base.lower()
             m = re.match(r'^([\w.-]+)/([\w.-]+)$', base)
             if m and len(m.group(2)) >= 2 and m.group(1) != 'www' and \
-                    f'{m.group(1)}/{m.group(2)}' not in self.invalid:
+                    not self._is_invalid(f'{m.group(1)}/{m.group(2)}'):
+                self.gh_blob = None            # racine du depot, pas une vue fichier
                 return 'github', f'{m.group(1)}/{m.group(2)}', tab
             if bl.endswith('- youtube'):
                 return 'youtube', url, tab
@@ -344,10 +372,11 @@ class ContextuelApp(App):
             if 'boîte de réception' in bl or bl.endswith('messagerie') \
                     or ' - gmail' in bl:
                 return 'gmail', url or 'https://mail.google.com/mail/u/0/', tab
-            if bl.endswith('wikipédia') or bl.endswith('wikipedia'):
-                t = base.rsplit('—', 1)[0].strip() or base
-                return 'wiki', {'lang': 'fr' if 'wikipédia' in bl else 'en',
-                                'title': t}, tab
+            if bl.endswith(('wikipédia', 'wikipedia')):
+                lang = 'fr' if bl.endswith('wikipédia') else 'en'
+                # "Article — Wikipédia" (fr) comme "Article - Wikipedia" (en)
+                t = WIKI_SUFFIX[lang].sub('', base).strip() or base
+                return 'wiki', {'lang': lang, 'title': t}, tab
             if bl.endswith('hugging face'):
                 model = re.sub(r'\s*[·-]?\s*hugging face\s*$', '', base,
                                flags=re.I).strip()
@@ -360,8 +389,8 @@ class ContextuelApp(App):
                     or 'search console' in bl:
                 return 'gsc', url, tab
             # --- ensuite par URL (precis, mais potentiellement en retard)
-            host = urlsplit(url).netloc.lower()
-            path = urlsplit(url).path
+            host = safe_urlsplit(url).netloc.lower()
+            path = safe_urlsplit(url).path
             if host == 'search.google.com' and 'search-console' in url:
                 return 'gsc', url, tab
             if host == 'mail.google.com':
@@ -385,7 +414,7 @@ class ContextuelApp(App):
                         'settings', 'spaces', 'datasets', 'models', 'docs',
                         'blog', 'join', 'login', 'logout', 'signup',
                         'tasks', 'trending', 'papers', 'organizations',
-                        'jobs', 'checkout', 'docs'):
+                        'jobs', 'checkout'):
                     return 'hf', f'{m.group(1)}/{m.group(2)}', tab
             if 'github.com' in host:
                 md = re.match(r'^/([\w.-]+)/([\w.-]+)/(pull|issues)/(\d+)',
@@ -651,41 +680,43 @@ class ContextuelApp(App):
             self._inflight.discard(fk)
             self.d._redraw_now()
 
+    def _uia_texts(self, hwnd, maxlen=220, budget=2.5, max_nodes=4000):
+        """Noms des elements de l'arbre UIA de la fenetre hwnd. A executer DANS
+        le thread UIA : uiatabs.run_in_uia_thread(lambda: self._uia_texts(h))."""
+        import uiautomation as auto
+        texts = []
+        t0 = time.time()
+
+        def walk(ctrl, depth):
+            if depth > 40 or len(texts) > max_nodes or time.time() - t0 > budget:
+                return
+            try:
+                kids = ctrl.GetChildren()
+            except Exception:
+                return
+            for ch in kids:
+                try:
+                    n = (ch.Name or '').strip()
+                    if n and len(n) < maxlen:
+                        texts.append(n)
+                except Exception:
+                    pass
+                walk(ch, depth + 1)
+
+        c = auto.ControlFromHandle(hwnd)
+        if c is not None:
+            walk(c, 0)
+        return texts
+
     def _fetch_page(self, url):
         """Lecture d'ecran GENERIQUE : quelques lignes de contenu de la page
-        (pour la fiche site) — executee une seule fois par URL."""
+        (pour la fiche site) — une fois par URL. hwnd est FIGE ici : le job
+        tourne plus tard, dans le thread UIA (le premier plan peut changer)."""
         import uiatabs
-
-        def read_page():
-            import uiautomation as auto
-            c = auto.ControlFromHandle(self.hwnd)
-            texts = []
-            t0 = time.time()
-
-            def walk(ctrl, depth):
-                if depth > 40 or len(texts) > 4000 \
-                        or time.time() - t0 > 2.5:
-                    return
-                try:
-                    kids = ctrl.GetChildren()
-                except Exception:
-                    return
-                for ch in kids:
-                    try:
-                        n = (ch.Name or '').strip()
-                        if n and len(n) < 220:
-                            texts.append(n)
-                    except Exception:
-                        pass
-                    walk(ch, depth + 1)
-
-            if c is not None:
-                walk(c, 0)
-            return texts
-
-        lines = []
+        hwnd = self.hwnd
+        lines, err = [], None
         try:
-            texts = uiatabs.run_in_uia_thread(read_page) or []
+            texts = uiatabs.run_in_uia_thread(lambda: self._uia_texts(hwnd))
             seen = set()
             cands = []
             for t in texts:
@@ -697,48 +728,22 @@ class ContextuelApp(App):
                 seen.add(t)
                 cands.append(t)
             lines = cands[2:8]                   # sauter header/nav
+        except uiatabs.UiaTimeout:
+            err = 'ecran occupe'                 # on reessayera (30 s)
         except Exception as e:
             print('[page]', str(e)[:50], flush=True)
-        self.pages[url] = {'t': time.time(), 'lines': lines}
+            err = str(e)[:40]
+        self.pages[url] = {'t': time.time(), 'lines': lines, 'err': err}
         self._inflight.discard('page:' + url[:120])
         self.d._redraw_now()
 
-    def _fetch_ediseo(self):
-        """EdiSEO : lit le pipeline complet sur l'ecran (UIA).
-        Les nombres sont des TEXTES SEPARES ('33\u202f065' puis 'URLs
-        importées') — on scanne sequentiellement : chaque nombre precise
-        est memorise, puis apparie au label suivant."""
-        import uiatabs
-
-        def read_page():
-            import uiautomation as auto
-            c = auto.ControlFromHandle(self.hwnd)
-            texts = []
-            t0 = time.time()
-
-            def walk(ctrl, depth):
-                if depth > 40 or len(texts) > 4000 \
-                        or time.time() - t0 > 3.0:
-                    return
-                try:
-                    kids = ctrl.GetChildren()
-                except Exception:
-                    return
-                for ch in kids:
-                    try:
-                        n = (ch.Name or '').strip()
-                        if n and len(n) < 200:
-                            texts.append(n)
-                    except Exception:
-                        pass
-                    walk(ch, depth + 1)
-
-            if c is not None:
-                walk(c, 0)
-            return texts
-
-        def to_num(s):
-            v = s.strip().replace('\u202f', '').replace('\xa0', '') \
+    def _parse_ediseo(self, texts):
+        """Pipeline EdiSEO depuis la liste des textes de l'ecran. Les nombres
+        sont des TEXTES SEPARES ('12\u202f000' puis 'URLs importées') — on
+        scanne sequentiellement : chaque nombre precise est memorise, puis
+        apparie au label suivant."""
+        def to_num(x):
+            v = x.strip().replace('\u202f', '').replace('\xa0', '') \
                 .replace(' ', '')
             if re.fullmatch(r'[\d.,]+', v):
                 try:
@@ -748,160 +753,151 @@ class ContextuelApp(App):
             return None
 
         m = {}
-        try:
-            texts = uiatabs.run_in_uia_thread(read_page) or []
+        # scanner sequentiel : nombre -> label
+        last_num = None
+        pipeline = {}
+        pool_gen = {}
+        pool_jug = {}
+        in_gen_zone = False
+        in_jug_zone = False
+        for t in texts:
+            v = to_num(t)
+            if v is not None:
+                last_num = v
+                continue
+            tl = t.strip().lower()
+            # pipeline (entonnoir) — 'URLs importées' : libelle reel du tableau
+            # de bord depuis qu'il a une colonne '· CSV complet'
+            if tl in ('importées', 'urls importées'):
+                pipeline['importees'] = last_num
+            elif tl == 'en production':
+                pipeline['production'] = last_num
+            elif tl == 'générés':
+                pipeline['generes'] = last_num
+            elif tl == 'livrables' and last_num and last_num > 1000:
+                pipeline['livrables'] = last_num
+            # zones pools
+            if 'génération llm' in tl:
+                in_gen_zone, in_jug_zone = True, False
+            elif 'juge llm' in tl:
+                in_gen_zone, in_jug_zone = False, True
+            elif tl.startswith('①') or tl.startswith('②'):
+                in_gen_zone = in_jug_zone = False
+            if in_gen_zone:
+                if tl == 'en cours':
+                    pool_gen['cours'] = last_num
+                elif tl == 'en file':
+                    pool_gen['file'] = last_num
+            if in_jug_zone:
+                if tl == 'en cours':
+                    pool_jug['cours'] = last_num
+                elif tl == 'en file':
+                    pool_jug['file'] = last_num
+            # credits
+            if tl == 'crédits serper':
+                m['serper'] = last_num
+        # plafond : le nombre APRES 'plafond'
+        for i, t in enumerate(texts):
+            if t.strip().lower() == 'plafond':
+                for j in range(i + 1, min(i + 3, len(texts))):
+                    v = to_num(texts[j])
+                    if v is not None:
+                        m['serper_max'] = v
+                        break
+                break
+        # ETA : le texte suivant le mot-clé 'ETA'
+        def find_eta(zone):
+            for i, t in enumerate(zone):
+                if t.strip() == 'ETA':
+                    for j in range(i + 1, min(i + 3, len(zone))):
+                        v = zone[j].strip()
+                        if v and len(v) < 25 and v != '?':
+                            return v
+            return None                      # absent : ne compte pas comme une lecture
+        gen_start = next((i for i, t in enumerate(texts)
+                          if 'génération llm' in t.lower()), 0)
+        jug_start = next((i for i, t in enumerate(texts)
+                          if 'juge llm' in t.lower()), gen_start)
+        m['gen_eta'] = find_eta(texts[gen_start:gen_start + 40])
+        m['juge_eta'] = find_eta(texts[jug_start:jug_start + 40])
+        # derniere activite
+        for t in texts:
+            if re.match(r'^\d{2}:\d{2}:\d{2}$', t.strip()):
+                m['last_gen'] = t.strip()
+        m.update(pipeline)
+        m['gen_cours'] = pool_gen.get('cours')
+        m['gen_file'] = pool_gen.get('file')
+        m['juge_cours'] = pool_jug.get('cours')
+        m['juge_file'] = pool_jug.get('file')
+        return {k: v for k, v in m.items() if v is not None}
 
-            # scanner sequentiel : nombre -> label
-            last_num = None
-            pipeline = {}
-            pool_gen = {}
-            pool_jug = {}
-            in_gen_zone = False
-            in_jug_zone = False
-            for t in texts:
-                v = to_num(t)
-                if v is not None:
-                    last_num = v
-                    continue
-                tl = t.strip().lower()
-                # pipeline (entonnoir)
-                if tl == 'importées':
-                    pipeline['importees'] = last_num
-                elif tl == 'en production':
-                    pipeline['production'] = last_num
-                elif tl == 'générés':
-                    pipeline['generes'] = last_num
-                elif tl == 'livrables' and last_num and last_num > 1000:
-                    pipeline['livrables'] = last_num
-                # zones pools
-                if 'génération llm' in tl:
-                    in_gen_zone, in_jug_zone = True, False
-                elif 'juge llm' in tl:
-                    in_gen_zone, in_jug_zone = False, True
-                elif tl.startswith('①') or tl.startswith('②'):
-                    in_gen_zone = in_jug_zone = False
-                if in_gen_zone:
-                    if tl == 'en cours':
-                        pool_gen['cours'] = last_num
-                    elif tl == 'en file':
-                        pool_gen['file'] = last_num
-                    elif tl == 'eta' and last_num is None:
-                        pass          # ETA = texte suivant, pas nombre
-                if in_jug_zone:
-                    if tl == 'en cours':
-                        pool_jug['cours'] = last_num
-                    elif tl == 'en file':
-                        pool_jug['file'] = last_num
-                # credits
-                if tl == 'crédits serper':
-                    m['serper'] = last_num
-                elif tl == 'plafond' and m.get('serper'):
-                    pass              # plafond = nombre APRES (geré après)
-            # plafond : chercher le nombre APRES 'plafond'
-            for i, t in enumerate(texts):
-                if t.strip().lower() == 'plafond':
-                    for j in range(i + 1, min(i + 3, len(texts))):
-                        v = to_num(texts[j])
-                        if v is not None:
-                            m['serper_max'] = v
-                            break
-                    break
-            # ETA : chercher 'ETA' exact puis le texte suivant
-            def find_eta(zone_texts):
-                for i, t in enumerate(zone_texts):
-                    if t.strip() == 'ETA':
-                        for j in range(i + 1, min(i + 3,
-                                                  len(zone_texts))):
-                            v = zone_texts[j].strip()
-                            if v and len(v) < 25 and v != '?':
-                                return v
-                return '—'
-            gen_start = next((i for i, t in enumerate(texts)
-                              if 'génération llm' in t.lower()), 0)
-            jug_start = next((i for i, t in enumerate(texts)
-                              if 'juge llm' in t.lower()), gen_start)
-            m['gen_eta'] = find_eta(texts[gen_start:gen_start + 40])
-            m['juge_eta'] = find_eta(texts[jug_start:jug_start + 40])
-            # derniere activite
-            for t in texts:
-                if re.match(r'^\d{2}:\d{2}:\d{2}$', t.strip()):
-                    m['last_gen'] = t.strip()
-            m.update(pipeline)
-            m['gen_cours'] = pool_gen.get('cours')
-            m['gen_file'] = pool_gen.get('file')
-            m['juge_cours'] = pool_jug.get('cours')
-            m['juge_file'] = pool_jug.get('file')
-        except Exception as e:
-            print('[ediseo]', str(e)[:50], flush=True)
-        self.ediseo = {'t': time.time(), 'm': m}
+    def _fetch_ediseo(self, key=''):
+        """EdiSEO : lit le pipeline complet sur l'ecran (UIA), UNE fois par page
+        (pas de rafraichissement automatique : S4 = Relire). Si l'ecran n'a pas
+        encore affiche ses chiffres, on reessaie (page en cours de chargement)."""
+        import uiatabs
+        hwnd = self.hwnd                  # fige : le job s'executera plus tard
+        m, err = {}, None
+        for _ in range(3):
+            try:
+                texts = uiatabs.run_in_uia_thread(
+                    lambda: self._uia_texts(hwnd, 200, 3.0, 5000))
+            except uiatabs.UiaTimeout:
+                err = 'ecran occupe'
+                break
+            m = self._parse_ediseo(texts)
+            if m:
+                break
+            time.sleep(1.5)
+        self.ediseo = {'t': time.time(), 'k': key, 'm': m, 'err': err}
         self._inflight.discard('ediseo')
         self.d._redraw_now()
 
+    def _parse_gsc(self, texts):
+        """Les 4 metriques Search Console : nombre qui suit chaque label."""
+        def grab(label):
+            lab = label.lower()
+            for i, t in enumerate(texts):
+                tl = t.strip().lower()
+                if tl == lab:
+                    for j in range(i + 1, min(i + 4, len(texts))):
+                        v = texts[j].strip()
+                        if v.lower() != lab and re.match(
+                                r'^[\d\u202f\u00a0 .,kKmM%]+$', v):
+                            return v
+                if tl.startswith(lab):
+                    rest = t[len(label):].strip()
+                    if rest:
+                        return rest
+            return None
+
+        return {
+            'clics': grab('Nombre total de clics') or grab('Total clicks'),
+            'impressions': grab("Nombre total d'impressions")
+            or grab('Total impressions'),
+            'ctr': grab('CTR moyen') or grab('Average CTR'),
+            'position': grab('Position moyenne') or grab('Average position'),
+        }
+
     def _fetch_gsc(self, key=''):
-        """Search Console : LIT la page affichee via l'arbre d'accessibilite.
-        Le walk s'execute DANS le thread UIA dedie (uiatabs) — l'objet COM
-        global du paquet n'est pas utilisable depuis un autre thread."""
+        """Search Console : LIT la page affichee via l'arbre d'accessibilite,
+        UNE fois par page (S4 = Relire). Le walk s'execute DANS le thread UIA
+        dedie (uiatabs) : hwnd est fige au moment de la demande."""
         import uiatabs
-
-        def read_page():
-            import uiautomation as auto
-            c = auto.ControlFromHandle(self.hwnd)
-            texts = []
-            t0 = time.time()
-
-            def walk(ctrl, depth):
-                if depth > 40 or len(texts) > 5000 \
-                        or time.time() - t0 > 3.0:
-                    return
-                try:
-                    kids = ctrl.GetChildren()
-                except Exception:
-                    return
-                for ch in kids:
-                    try:
-                        n = (ch.Name or '').strip()
-                        if n and len(n) < 120:
-                            texts.append(n)
-                    except Exception:
-                        pass
-                    walk(ch, depth + 1)
-
-            if c is not None:
-                walk(c, 0)
-            return texts
-
-        metrics = None
-        try:
-            texts = uiatabs.run_in_uia_thread(read_page) or []
-
-            def grab(label):
-                lab = label.lower()
-                for i, t in enumerate(texts):
-                    tl = t.strip().lower()
-                    if tl == lab:
-                        for j in range(i + 1, min(i + 4, len(texts))):
-                            v = texts[j].strip()
-                            if v.lower() != lab and re.match(
-                                    r'^[\d\u202f\u00a0 .,kKmM%]+$', v):
-                                return v
-                    if tl.startswith(lab):
-                        rest = t[len(label):].strip()
-                        if rest:
-                            return rest
-                return None
-
-            metrics = {
-                'clics': grab('Nombre total de clics')
-                or grab('Total clicks'),
-                'impressions': grab("Nombre total d'impressions")
-                or grab('Total impressions'),
-                'ctr': grab('CTR moyen') or grab('Average CTR'),
-                'position': grab('Position moyenne')
-                or grab('Average position'),
-            }
-        except Exception as e:
-            print('[gsc]', str(e)[:60], flush=True)
-        self.gsc = {'t': time.time(), 'm': metrics, 'k': key}
+        hwnd = self.hwnd
+        metrics, err = None, None
+        for _ in range(3):                 # chiffres pas encore affiches : on reessaie
+            try:
+                texts = uiatabs.run_in_uia_thread(
+                    lambda: self._uia_texts(hwnd, 120, 3.0, 5000))
+            except uiatabs.UiaTimeout:
+                err = 'ecran occupe'
+                break
+            metrics = self._parse_gsc(texts)
+            if any(metrics.values()):
+                break
+            time.sleep(1.5)
+        self.gsc = {'t': time.time(), 'm': metrics, 'k': key, 'err': err}
         self._inflight.discard('gsc')
         self.d._redraw_now()
 
@@ -959,7 +955,9 @@ class ContextuelApp(App):
                                 'avatar': self._fetch_avatar(data)}
             self.cache[full] = self.cache[repo]      # alias casse differente
         except Exception as e:
-            self.invalid.add(repo)                   # pas un repo (ou echec)
+            # depot inconnu (404) : invalide definitivement. Panne reseau ou gh :
+            # temporaire — on reessaiera au lieu de perdre la fiche jusqu'au reload.
+            self.invalid[repo] = None if _not_found(e) else time.time()
             if self.repo == repo:
                 self.repo = None
             print(f'[contexte] {repo} invalide: {e}', flush=True)
@@ -990,8 +988,7 @@ class ContextuelApp(App):
             from urllib.parse import quote_plus as _qp
             q = self._gq()
             if n == 1:
-                clipboard_set(q)
-                self.alert('requete copiee')
+                self._copy(q, 'requete copiee')
             elif n == 2:                      # I'm feeling lucky
                 os.startfile('https://www.google.com/search?q=' + _qp(q)
                              + '&btnI')
@@ -1010,13 +1007,11 @@ class ContextuelApp(App):
                 keysend.tap('volumeup')
         elif self.kind == 'chat' and self.pl:
             import keysend
-            host = urlsplit(self.pl).netloc
+            host = safe_urlsplit(self.pl).netloc
             if n == 1:
-                clipboard_set(tab.get('title') or '')
-                self.alert('titre copie')
+                self._copy(tab.get('title') or '', 'titre copie')
             elif n == 2:
-                clipboard_set(self.pl)
-                self.alert('URL copiee')
+                self._copy(self.pl, 'URL copiee')
             elif n == 3:                      # nouvelle conversation
                 os.startfile('https://' + host + '/')
                 self.alert('accueil ' + host)
@@ -1032,32 +1027,29 @@ class ContextuelApp(App):
             import keysend
             m = (self.ediseo or {}).get('m') or {}
             if n == 1:
-                clipboard_set(
-                    'Import {:,.0f} | Prod {:,.0f} | Générés {:,.0f} | '
-                    'Livrables {:,.0f}'.format(
-                        m.get('importees') or 0, m.get('production') or 0,
-                        m.get('generes') or 0, m.get('livrables') or 0)
-                    .replace(',', ' '))
-                self.alert('pipeline copie')
+                self._copy('Import {:,.0f} | Prod {:,.0f} | Générés {:,.0f} | '
+                           'Livrables {:,.0f}'.format(
+                               m.get('importees') or 0, m.get('production') or 0,
+                               m.get('generes') or 0, m.get('livrables') or 0)
+                           .replace(',', ' '), 'pipeline copie')
             elif n == 2:
-                clipboard_set(
-                    'Gen: {} cours / {} file (ETA {}) | '
-                    'Juge: {} cours / {} file (ETA {})'.format(
-                        int(m.get('gen_cours') or 0),
-                        int(m.get('gen_file') or 0), m.get('gen_eta') or '?',
-                        int(m.get('juge_cours') or 0),
-                        int(m.get('juge_file') or 0),
-                        m.get('juge_eta') or '?'))
-                self.alert('LLM copie')
+                self._copy('Gen: {} cours / {} file (ETA {}) | '
+                           'Juge: {} cours / {} file (ETA {})'.format(
+                               int(m.get('gen_cours') or 0),
+                               int(m.get('gen_file') or 0), m.get('gen_eta') or '?',
+                               int(m.get('juge_cours') or 0),
+                               int(m.get('juge_file') or 0),
+                               m.get('juge_eta') or '?'), 'LLM copie')
             elif n == 3:
-                clipboard_set('Serper {:,.0f} / {:,.0f}'.format(
+                self._copy('Serper {:,.0f} / {:,.0f}'.format(
                     m.get('serper') or 0,
-                    m.get('serper_max') or 0).replace(',', ' '))
-                self.alert('credits copies')
-            elif n == 4:
-                webbrowser.open('https://www.google.com/search?q='
-                                'sarenza ediseo seo pipeline'
-                                .replace(' ', '+'))
+                    m.get('serper_max') or 0).replace(',', ' '), 'credits copies')
+            elif n == 4:                        # relire l'ecran maintenant
+                if 'ediseo' not in self._inflight:
+                    self._inflight.add('ediseo')
+                    threading.Thread(target=self._fetch_ediseo,
+                                     args=(self.pl or '',), daemon=True).start()
+                    self.alert('relecture...')
             elif n == 5:
                 keysend.tap('volumedown')
             elif n == 6:
@@ -1065,20 +1057,17 @@ class ContextuelApp(App):
         elif self.kind == 'gsc':
             import keysend
             if n == 1:
-                clipboard_set(self.pl or '')
-                self.alert('URL copiee')
+                self._copy(self.pl or '', 'URL copiee')
             elif n == 2:
-                clipboard_set(tab.get('title') or '')
-                self.alert('titre copie')
+                self._copy(tab.get('title') or '', 'titre copie')
             elif n == 3:
                 m = (self.gsc or {}).get('m') or {}
-                clipboard_set('Clics {} | Impressions {} | CTR {} | '
-                              'Position {}'.format(
-                                  m.get('clics') or '?',
-                                  m.get('impressions') or '?',
-                                  m.get('ctr') or '?',
-                                  m.get('position') or '?'))
-                self.alert('valeurs copiees')
+                self._copy('Clics {} | Impressions {} | CTR {} | '
+                           'Position {}'.format(
+                               m.get('clics') or '?',
+                               m.get('impressions') or '?',
+                               m.get('ctr') or '?',
+                               m.get('position') or '?'), 'valeurs copiees')
             elif n == 4:                     # relire l'ecran maintenant
                 if 'gsc' not in self._inflight:
                     self._inflight.add('gsc')
@@ -1101,11 +1090,9 @@ class ContextuelApp(App):
                 'https://{}.wikipedia.org/wiki/{}'.format(
                     pl['lang'], pl['title'].replace(' ', '_'))
             if n == 1:
-                clipboard_set(data.get('title') or pl['title'])
-                self.alert('titre copie')
+                self._copy(data.get('title') or pl['title'], 'titre copie')
             elif n == 2:
-                clipboard_set(url)
-                self.alert('lien copie')
+                self._copy(url, 'lien copie')
             elif n == 3:                  # meme article, autre langue
                 other = 'en' if pl['lang'] == 'fr' else 'fr'
                 os.startfile('https://{}.wikipedia.org/wiki/{}'.format(
@@ -1128,15 +1115,13 @@ class ContextuelApp(App):
                              '?compose=new')
                 self.alert('nouveau message')
             elif n == 2 and m2:
-                clipboard_set(m2.group(1))
-                self.alert('adresse copiee')
+                self._copy(m2.group(1), 'adresse copiee')
             elif n == 3:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (tab.get('title') or 'gmail')
                                 .replace(' ', '+'))
             elif n == 4:
-                clipboard_set(self.pl or '')
-                self.alert('URL copiee')
+                self._copy(self.pl or '', 'URL copiee')
             elif n == 5:
                 keysend.tap('volumedown')
             elif n == 6:
@@ -1150,20 +1135,17 @@ class ContextuelApp(App):
                 pl['repo'], 'pull' if pl['kind'] == 'pull' else 'issues',
                 pl['n'])
             if n == 1:
-                clipboard_set(base)
-                self.alert('lien copie')
+                self._copy(base, 'lien copie')
             elif n == 2:
-                clipboard_set(data.get('title', ''))
-                self.alert('titre copie')
+                self._copy(data.get('title', ''), 'titre copie')
             elif n == 3:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (data.get('title') or
                                  '{} #{}'.format(pl['repo'], pl['n']))
                                 .replace(' ', '+'))
             elif n == 4:
-                clipboard_set(base + ('/files' if pl['kind'] == 'pull'
-                                      else ''))
-                self.alert('lien ' + ('fichiers' if pl['kind'] == 'pull'
+                self._copy(base + ('/files' if pl['kind'] == 'pull' else ''),
+                           'lien ' + ('fichiers' if pl['kind'] == 'pull'
                                       else 'discussion'))
             elif n == 5:
                 keysend.tap('volumedown')
@@ -1173,14 +1155,11 @@ class ContextuelApp(App):
             import keysend
             model = self.pl
             if n == 1:
-                clipboard_set(model)
-                self.alert('ID copie')
+                self._copy(model, 'ID copie')
             elif n == 2:
-                clipboard_set('https://huggingface.co/' + model)
-                self.alert('page copiee')
+                self._copy('https://huggingface.co/' + model, 'page copiee')
             elif n == 3:
-                clipboard_set('huggingface-cli download ' + model)
-                self.alert('commande copiee')
+                self._copy('huggingface-cli download ' + model, 'commande copiee')
             elif n == 4:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 model.replace('/', ' ').replace(' ', '+'))
@@ -1197,11 +1176,9 @@ class ContextuelApp(App):
             if n == 1:
                 keysend.tap('playpause')
             elif n == 2:
-                clipboard_set(self.pl)
-                self.alert('URL copiee')
+                self._copy(self.pl, 'URL copiee')
             elif n == 3:
-                clipboard_set(title)
-                self.alert('titre copie')
+                self._copy(title, 'titre copie')
             elif n == 4:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (title or '').replace(' ', '+'))
@@ -1211,13 +1188,11 @@ class ContextuelApp(App):
                 keysend.tap('volumeup')
         elif self.kind == 'site' and self.pl:
             import keysend
-            host = urlsplit(self.pl).netloc
+            host = safe_urlsplit(self.pl).netloc
             if n == 1:
-                clipboard_set(self.pl)
-                self.alert('URL copiee')
+                self._copy(self.pl, 'URL copiee')
             elif n == 2:
-                clipboard_set(tab.get('title') or '')
-                self.alert('titre copie')
+                self._copy(tab.get('title') or '', 'titre copie')
             elif n == 3:                    # recherche dans le site
                 webbrowser.open('https://www.google.com/search?q='
                                 'site:' + host + ' ' +
@@ -1239,11 +1214,9 @@ class ContextuelApp(App):
             fk = self._filekind(single) if single else None
             if fk:                             # --- selection unique typee
                 if n == 1:
-                    clipboard_set(single)
-                    self.alert('chemin copie')
+                    self._copy(single, 'chemin copie')
                 elif n == 2:
-                    clipboard_set(self._unix_path(single))
-                    self.alert('unix copie')
+                    self._copy(self._unix_path(single), 'unix copie')
                 elif n == 3:
                     if fk == 'image':          # zoom plein ecran
                         self.exp_zoom = not self.exp_zoom
@@ -1270,12 +1243,13 @@ class ContextuelApp(App):
                             else:
                                 self.alert('ffplay introuvable')
                     elif fk == 'py':           # executer dans un terminal
-                        try:
-                            subprocess.Popen(['wt', 'python', single])
-                        except FileNotFoundError:
-                            subprocess.Popen(['cmd', '/c', 'start', 'cmd',
-                                              '/k', 'python', single])
-                        self.alert('execution...')
+                        if self._confirm_exec(single):   # 2x : rien ne part par erreur
+                            try:
+                                subprocess.Popen(['wt', 'python', single])
+                            except FileNotFoundError:
+                                subprocess.Popen(['cmd', '/c', 'start', 'cmd',
+                                                  '/k', 'python', single])
+                            self.alert('execution...')
                     elif fk == 'zip':
                         try:
                             import zipfile
@@ -1314,11 +1288,10 @@ class ContextuelApp(App):
                 fpath = sel[0] if sel else path
                 if n == 1:
                     if len(sel) > 1:            # copier toute la selection
-                        clipboard_set('\n'.join(sel))
-                        self.alert('{} chemins copies'.format(len(sel)))
+                        self._copy('\n'.join(sel),
+                                   '{} chemins copies'.format(len(sel)))
                     else:
-                        clipboard_set(fpath)
-                        self.alert('chemin copie')
+                        self._copy(fpath, 'chemin copie')
                 elif n == 2:
                     try:
                         subprocess.Popen(['wt', '-d', path])
@@ -1327,8 +1300,7 @@ class ContextuelApp(App):
                                           'cd', '/d', path])
                     self.alert('terminal ouvert')
                 elif n == 3:
-                    clipboard_set(self._unix_path(fpath))
-                    self.alert('chemin unix copie')
+                    self._copy(self._unix_path(fpath), 'chemin unix copie')
                 elif n == 4:
                     parent = os.path.dirname(path.rstrip('\\/'))
                     if parent and parent != path:
@@ -1363,11 +1335,9 @@ class ContextuelApp(App):
         elif self.kind == 'code' and isinstance(self.pl, dict):
             import keysend
             if n == 1:
-                clipboard_set(self.pl.get('file', ''))
-                self.alert('fichier copie')
+                self._copy(self.pl.get('file', ''), 'fichier copie')
             elif n == 2:
-                clipboard_set(self.pl.get('ws', ''))
-                self.alert('workspace copie')
+                self._copy(self.pl.get('ws', ''), 'workspace copie')
             elif n == 3:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 (self.pl.get('file', '') + ' '
@@ -1388,14 +1358,12 @@ class ContextuelApp(App):
             import keysend
             cwd = self.pl.get('cwd')
             if n == 1 and cwd:
-                clipboard_set(cwd)
-                self.alert('chemin copie')
+                self._copy(cwd, 'chemin copie')
             elif n == 2 and cwd:
                 os.startfile(cwd)
                 self.alert('explorateur ouvert')
             elif n == 3 and cwd:
-                clipboard_set(self._unix_path(cwd))
-                self.alert('chemin unix copie')
+                self._copy(self._unix_path(cwd), 'chemin unix copie')
             elif n == 4:
                 webbrowser.open('https://www.google.com/search?q=' +
                                 self.wtitle.replace(' ', '+'))
@@ -1410,8 +1378,7 @@ class ContextuelApp(App):
             elif n == 2:
                 keysend.tap('s')
             elif n == 3:
-                clipboard_set((self.pl or {}).get('name', ''))
-                self.alert('titre copie')
+                self._copy((self.pl or {}).get('name', ''), 'titre copie')
             elif n == 4:
                 keysend.tap('m')
             elif n == 5:
@@ -1430,20 +1397,17 @@ class ContextuelApp(App):
                 webbrowser.open(base)
             elif n == 5:
                 if self.gh_blob:               # vue fichier : URL raw
-                    clipboard_set(
+                    ok = clipboard_set(
                         'https://raw.githubusercontent.com/{}/{}/{}'.format(
                             self.repo, self.gh_blob[0], self.gh_blob[1]))
-                    self.alert('URL raw copiee')
+                    self.alert('URL raw copiee' if ok else 'presse-papiers occupe')
                 else:
-                    clipboard_set(base)
-                    self.alert('URL copiee')
+                    self._copy(base, 'URL copiee')
             elif n == 6:
-                clipboard_set(f'gh repo clone {self.repo}')
-                self.alert('cmd clone copiee')
+                self._copy(f'gh repo clone {self.repo}', 'cmd clone copiee')
         else:
             if n == 1:
-                clipboard_set(self.wtitle)
-                self.alert('titre copie')
+                self._copy(self.wtitle, 'titre copie')
             elif n == 2 and self.hwnd:             # toujours au premier plan
                 on = not self.topmost
                 if u32.SetWindowPos(self.hwnd, wt.HWND(-1 if on else -2),
@@ -1462,17 +1426,37 @@ class ContextuelApp(App):
                 if self._confirm('restart'):
                     self._do_restart()
             elif n == 6:
-                clipboard_set(self.exe or '?')
-                self.alert('chemin exe copie' if self.exe else 'exe inconnu')
+                ok = clipboard_set(self.exe or '?')
+                self.alert(('chemin exe copie' if self.exe else 'exe inconnu')
+                           if ok else 'presse-papiers occupe')
+
+    def _copy(self, text, msg):
+        """Presse-papiers + banniere HONNETE : 'copie' seulement si c'est
+        vraiment pose (le presse-papiers peut etre verrouille par un autre logiciel)."""
+        self.alert(msg if clipboard_set(text) else 'presse-papiers occupe')
 
     def _confirm(self, action):
-        """Double appui : 1er appui arme (retourne False), 2e = confirme."""
+        """Double appui : 1er appui arme (retourne False), 2e = confirme — a
+        condition que ce soit la MEME fenetre (pid). Si le premier plan a
+        change entre les deux appuis, on re-arme au lieu de tuer la nouvelle."""
         now = time.time()
-        if self._armed and self._armed[0] == action and now - self._armed[1] < 3.0:
+        if (self._armed and self._armed[0] == action and self._armed[1] == self.pid
+                and now - self._armed[2] < 3.0):
             self._armed = None
             return True
-        self._armed = (action, now)
+        self._armed = (action, self.pid, now)
         self.alert('re-appuyez pour ' + action)
+        return False
+
+    def _confirm_exec(self, path):
+        """Comme _confirm, pour lancer un script : deux appuis sur le MEME fichier."""
+        now = time.time()
+        a = self._armed_exec
+        if a and a[0] == path and now - a[1] < 3.0:
+            self._armed_exec = None
+            return True
+        self._armed_exec = (path, now)
+        self.alert('re-appuyez pour executer')
         return False
 
     def _do_kill(self):
@@ -1620,7 +1604,13 @@ class ContextuelApp(App):
             return sel[0]
         return None
 
+    def on_enter(self):
+        # page courante : passage immediat + onglets des navigateurs a cadence normale
+        self._wake.set()
+        self.hold_tabs()
+
     def on_leave(self):
+        self.release_tabs()
         if self._player is not None and self._player.poll() is None:
             try:
                 self._player.terminate()
@@ -1714,6 +1704,16 @@ class ContextuelApp(App):
         if cur:
             lines.append(cur)
         return lines or [' ']
+
+    @staticmethod
+    def _fit(d, text, font, maxw):
+        """Texte tronque avec « … » pour tenir dans maxw pixels."""
+        text = text or ''
+        if d.textlength(text, font=font) <= maxw:
+            return text
+        while text and d.textlength(text + '…', font=font) > maxw:
+            text = text[:-1]
+        return text + '…'
 
     def _rg_github(self, img, d):
         if not self.repo:                    # course avec le thread watch
@@ -1829,7 +1829,6 @@ class ContextuelApp(App):
             dy += 12
 
     def _rg_youtube(self, img, d):
-        F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         e = self.yt.get(self.pl) or {}
@@ -1886,7 +1885,7 @@ class ContextuelApp(App):
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         tab = self.tab or {}
-        u = urlsplit(self.pl or '')
+        u = safe_urlsplit(self.pl or '')
         host = u.netloc
         caps = [
             (charte.ico_link, 'URL', '', None, False),
@@ -1946,9 +1945,9 @@ class ContextuelApp(App):
         d.text((106, 166), 'PAGE (lecture ecran)', font=F_T,
                fill=(120, 160, 230), anchor='lm')
         yy = 184
-        if not pg:
-            d.text((106, yy), 'lecture de la page...', font=F_T,
-                   fill=charte.DIM, anchor='lm')
+        if not pg or pg.get('err'):
+            d.text((106, yy), 'lecture impossible' if pg else 'lecture de la page...',
+                   font=F_T, fill=charte.DIM, anchor='lm')
         else:
             for ln in plines[:4]:
                 while ln and d.textlength(ln, font=F_T) > 200:
@@ -2306,7 +2305,6 @@ class ContextuelApp(App):
                fill=(90, 95, 110), anchor='lm')
 
     def _rg_ghpage(self, img, d):
-        F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         pl = self.pl or {}
@@ -2450,16 +2448,15 @@ class ContextuelApp(App):
             if t.endswith(suf):
                 return t[:-len(suf)]
         from urllib.parse import parse_qs as _pqs
-        return (_pqs(urlsplit(getattr(self, 'pl', '') or '').query)
+        return (_pqs(safe_urlsplit(getattr(self, 'pl', '') or '').query)
                 .get('q') or [''])[0]
 
     def _rg_gsearch(self, img, d):
         """Recherche Google : requete + RESULTAT DE CALCUL local + outils."""
         from urllib.parse import parse_qs as _pqs
-        F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
-        u = urlsplit(self.pl or '')
+        u = safe_urlsplit(self.pl or '')
         q = self._gq()
         tbm = (_pqs(u.query).get('tbm') or [''])[0]
         res = self._calc(q)
@@ -2553,7 +2550,7 @@ class ContextuelApp(App):
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         tab = self.tab or {}
-        host = urlsplit(self.pl or '').netloc.replace('www.', '')
+        host = safe_urlsplit(self.pl or '').netloc.replace('www.', '')
         caps = [
             (charte.ico_copy, 'Titre', '', None, False),
             (charte.ico_link, 'URL', '', None, False),
@@ -2622,23 +2619,25 @@ class ContextuelApp(App):
         else:
             av = charte.letter_avatar(pl.get('title') or '?', 56, 8)
             img.paste(av, (106, 12), charte.rounded(av, 8))
-        import textwrap
-        t_lines = textwrap.wrap(data.get('title') or pl.get('title') or '?',
-                                22)[:2]
-        d.text((170, 22), t_lines[0], font=F_S, fill=charte.FG, anchor='lm')
-        if len(t_lines) > 1:
-            d.text((170, 42), t_lines[1], font=F_XS, fill=charte.DIM,
-                   anchor='lm')
+        title = data.get('title') or pl.get('title') or '?'
+        # en-tete : 1re ligne bornee par le badge (x > 270), la 2e est en
+        # dessous ; tout est ajuste en PIXELS (plus de debordement a droite)
+        w1 = self._wrap(d, title, 100, F_S)
+        d.text((170, 22), w1[0], font=F_S, fill=charte.FG, anchor='lm')
+        if len(w1) > 1:
+            d.text((170, 42), self._fit(d, ' '.join(w1[1:]), F_XS, 143),
+                   font=F_XS, fill=charte.DIM, anchor='lm')
         if data.get('description'):
-            d.text((170, 56), data['description'][:26], font=F_T,
-                   fill=(150, 160, 200), anchor='lm')
+            d.text((170, 56), self._fit(d, data['description'], F_T, 143),
+                   font=F_T, fill=(150, 160, 200), anchor='lm')
         d.line((106, 74, 313, 74), fill=charte.BORDER)
         d.text((106, 86), 'RESUME  (molette droite = defiler)', font=F_T,
                fill=charte.DIM, anchor='lm')
         extract = data.get('extract') or c.get('err') or \
             'chargement du resume...'
-        lines = textwrap.wrap(extract, 38)
-        vis = lines[self.scroll:self.scroll + 7]
+        lines = self._wrap(d, extract, 200, F_T)   # 106 -> 306 : dans le panneau
+        s0 = min(max(0, self.scroll), max(0, len(lines) - 7))   # jamais dans le vide
+        vis = lines[s0:s0 + 7]
         yy = 106
         for ln in vis:
             d.text((106, yy), ln, font=F_T, fill=charte.FG, anchor='lm')
@@ -2646,11 +2645,12 @@ class ContextuelApp(App):
         if len(lines) > 7:
             d.rectangle((314, 100, 316, 234), fill=(30, 35, 50))
             th_h = 134 * 7 // len(lines)
-            ty = 100 + (134 - th_h) * self.scroll // max(1, len(lines) - 7)
+            ty = 100 + (134 - th_h) * s0 // max(1, len(lines) - 7)
             d.rectangle((314, ty, 316, ty + th_h), fill=charte.BLUE)
 
     def _rg_gsc(self, img, d):
-        """Search Console : metriques lues SUR LA PAGE (arbre UIA)."""
+        """Search Console : metriques lues SUR LA PAGE (arbre UIA), une fois a
+        l'ouverture de la page (S4 = Relire)."""
         F_T = fipui.font(11)
         F_XS = fipui.font(13)
         caps = [
@@ -2668,18 +2668,25 @@ class ContextuelApp(App):
         self._chip(d, 311, 10, 'GSC', (70, 140, 250))
         d.text((106, 28), 'Performances', font=fipui.font(15),
                fill=charte.FG, anchor='lm')
-        d.text((106, 48), 'search console · lecture ecran', font=F_T,
-               fill=charte.DIM, anchor='lm')
-        m = (self.gsc or {}).get('m')
-        if m is None and self.gsc is None:
+        d.text((106, 48), 'search console', font=F_T, fill=charte.DIM,
+               anchor='lm')
+        g = self.gsc
+        if g is None:
             d.text((210, 110), 'lecture de la page...', font=F_XS,
                    fill=charte.DIM, anchor='mm')
             return
+        m = g.get('m') or {}
+        if g.get('err') or not any(m.values()):
+            d.text((210, 96), g.get('err') or 'métriques introuvables', font=F_T,
+                   fill=charte.RED, anchor='mm')
+            d.text((210, 116), 'S4 = relire', font=F_T, fill=charte.DIM,
+                   anchor='mm')
+            return
         tiles = [
-            ('CLICS', m and m.get('clics'), charte.GREEN),
-            ('IMPRESSIONS', m and m.get('impressions'), charte.BLUE),
-            ('CTR', m and m.get('ctr'), charte.PURPLE),
-            ('POSITION', m and m.get('position'), charte.ORANGE),
+            ('CLICS', m.get('clics'), charte.GREEN),
+            ('IMPRESSIONS', m.get('impressions'), charte.BLUE),
+            ('CTR', m.get('ctr'), charte.PURPLE),
+            ('POSITION', m.get('position'), charte.ORANGE),
         ]
         for i, (lab, val, col) in enumerate(tiles):
             x0 = 106 + (i % 2) * 106
@@ -2691,13 +2698,13 @@ class ContextuelApp(App):
             v = val if val else '—'
             f = fipui.font(24 if len(v) <= 6 else 18)
             d.text((x0 + 8, y0 + 33), v, font=f, fill=col, anchor='lm')
-        d.text((106, 196), 'lecture de l\'ecran a l\'ouverture de la page',
-               font=F_T, fill=(90, 95, 110), anchor='lm')
-        d.text((106, 214), 'S3 = copier les 4 valeurs · S4 = relire',
-               font=F_T, fill=(90, 95, 110), anchor='lm')
+        d.text((106, 214), 'S3 = copier · S4 = relire', font=F_T,
+               fill=(90, 95, 110), anchor='lm')
 
     def _rg_ediseo(self, img, d):
-        """EdiSEO : pipeline SEO complet — funnel, pools LLM, credits."""
+        """EdiSEO : pipeline SEO complet — entonnoir, pools LLM, credits.
+        Lu UNE fois a l'arrivee sur la page (pas de rafraichissement
+        automatique : S4 = Relire)."""
         F_S = fipui.font(15)
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
@@ -2705,7 +2712,7 @@ class ContextuelApp(App):
             (charte.ico_copy, 'Pipeline', '', None, False),
             (charte.ico_copy, 'LLM', '', None, False),
             (charte.ico_copy, 'Crédits', '', None, False),
-            (charte.ico_home, 'Google', '', None, False),
+            (charte.ico_clock, 'Relire', '', None, False),
             (charte.ico_min, 'Vol-', '', None, False),
             (charte.ico_min, 'Vol+', '', None, False),
         ]
@@ -2715,23 +2722,25 @@ class ContextuelApp(App):
         charte.panel(d, (98, 4, 317, 238))
         self._chip(d, 311, 10, 'SEO', charte.TEAL)
         m = (self.ediseo or {}).get('m')
-        if m is None and self.ediseo is None:
+        if self.ediseo is None:
             d.text((210, 110), 'lecture du pipeline...', font=F_XS,
                    fill=charte.DIM, anchor='mm')
             return
-        if not m:
-            d.text((210, 100), 'extraction echouee', font=F_XS,
-                   fill=charte.RED, anchor='mm')
-            return
         d.text((106, 26), 'EdiSEO Pipeline', font=F_S, fill=charte.FG,
                anchor='lm')
+        if self.ediseo.get('err') or not m:
+            d.text((210, 100), self.ediseo.get('err') or 'extraction echouee',
+                   font=F_XS, fill=charte.RED, anchor='mm')
+            d.text((210, 124), 'S4 = relire', font=F_XS, fill=charte.DIM,
+                   anchor='mm')
+            return
         if m.get('last_gen'):
             d.text((106, 47), 'dernier texte généré à ' + m['last_gen'],
                    font=F_T, fill=charte.GREEN, anchor='lm')
         else:
             d.text((106, 47), 'sarenza · pipeline auto actif', font=F_T,
                    fill=charte.DIM, anchor='lm')
-        # entonnoir compact
+        # entonnoir compact : barres a gauche, valeurs alignees a DROITE
         d.line((106, 60, 313, 60), fill=charte.BORDER)
         stages = [
             ('Import', m.get('importees'), charte.DIM),
@@ -2739,68 +2748,52 @@ class ContextuelApp(App):
             ('DSR', m.get('generes'), charte.PURPLE),
             ('Livrables', m.get('livrables'), charte.GREEN),
         ]
-        max_v = max(v for _, v, _ in stages if isinstance(v, (int, float))
-                    ) if any(isinstance(v, (int, float))
-                             for _, v, _ in stages) else 1
+        nums = [v for _, v, _ in stages if isinstance(v, (int, float))]
+        max_v = max(nums) if nums else 1
         for i, (lab, val, col) in enumerate(stages):
             y = 68 + i * 16
-            d.text((106, y), '{:>10s}'.format(lab), font=F_T, fill=col,
-                   anchor='lm')
+            d.text((166, y), '{:>10s}'.format(lab), font=F_T, fill=col,
+                   anchor='rm')
             if isinstance(val, (int, float)):
-                w = int(120 * val / max_v)
-                d.rectangle((170, y - 5, 170 + max(2, w), y + 4), fill=col)
-                d.text((296, y), '{:>6.0f}'.format(val), font=F_T,
-                       fill=charte.FG, anchor='lm')
+                w = int(96 * val / max_v)
+                if w > 0:
+                    d.rectangle((170, y - 5, 170 + w, y + 4), fill=col)
+                d.text((313, y), '{:,.0f}'.format(val).replace(',', ' '),
+                       font=F_T, fill=charte.FG, anchor='rm')
             else:
-                d.text((296, y), '—', font=F_T, fill=charte.DIM,
-                       anchor='lm')
-        # pools actifs
+                d.text((313, y), '—', font=F_T, fill=charte.DIM, anchor='rm')
+        # pools actifs : une information par ligne, rien ne deborde
         d.line((106, 134, 313, 134), fill=charte.BORDER)
-        gen_on = isinstance(m.get('gen_cours'), (int, float)) \
-            and m['gen_cours'] > 0
-        d.rounded_rectangle((106, 142, 206, 180), radius=6,
-                            fill=(14, 34, 20) if gen_on else charte.CARD,
-                            outline=charte.GREEN if gen_on else charte.BORDER)
-        d.text((114, 152), '③ Génération', font=F_T, fill=charte.GREEN,
-               anchor='lm')
-        d.text((114, 168),
-               '{} cours · {} file'.format(
-                   int(m.get('gen_cours') or 0),
-                   int(m.get('gen_file') or 0)), font=F_T,
-               fill=charte.FG, anchor='lm')
-        if m.get('gen_eta') and m['gen_eta'] != '—':
-            d.text((114, 175), 'ETA ' + m['gen_eta'][:12], font=F_T,
+        pools = [
+            (106, '③ Génération', m.get('gen_cours'), m.get('gen_file'),
+             m.get('gen_eta')),
+            (214, '⚖ Juge', m.get('juge_cours'), m.get('juge_file'),
+             m.get('juge_eta')),
+        ]
+        for x0, title, cours, file_, eta in pools:
+            on = isinstance(cours, (int, float)) and cours > 0
+            d.rounded_rectangle((x0, 140, x0 + 99, 190), radius=6,
+                                fill=(14, 34, 20) if on else charte.CARD,
+                                outline=charte.GREEN if on else charte.BORDER)
+            d.text((x0 + 8, 148), title, font=F_T, fill=charte.GREEN, anchor='lm')
+            d.text((x0 + 8, 161), '{} en cours'.format(int(cours or 0)),
+                   font=F_T, fill=charte.FG, anchor='lm')
+            d.text((x0 + 8, 173), '{} en file'.format(int(file_ or 0)),
+                   font=F_T, fill=charte.FG, anchor='lm')
+            d.text((x0 + 8, 184), 'ETA ' + (eta or '—')[:12], font=F_T,
                    fill=charte.DIM, anchor='lm')
-        jug_on = isinstance(m.get('juge_cours'), (int, float)) \
-            and m['juge_cours'] > 0
-        d.rounded_rectangle((214, 142, 313, 180), radius=6,
-                            fill=(14, 34, 20) if jug_on else charte.CARD,
-                            outline=charte.GREEN if jug_on else charte.BORDER)
-        d.text((222, 152), '⚖ Juge', font=F_T, fill=charte.GREEN,
-               anchor='lm')
-        d.text((222, 168),
-               '{} cours · {} file'.format(
-                   int(m.get('juge_cours') or 0),
-                   int(m.get('juge_file') or 0)), font=F_T,
-               fill=charte.FG, anchor='lm')
-        if m.get('juge_eta') and m['juge_eta'] != '—':
-            d.text((222, 175), 'ETA ' + m['juge_eta'][:12], font=F_T,
-                   fill=charte.DIM, anchor='lm')
-        # crédits
-        d.line((106, 188, 313, 188), fill=charte.BORDER)
-        sv = m.get('serper')
-        sm = m.get('serper_max')
-        if isinstance(sv, (int, float)) and isinstance(sm, (int, float)) \
-                and sm > 0:
-            d.text((106, 200), 'Serper {:,.0f} / {:,.0f}'.format(
-                sv, sm).replace(',', ' '), font=F_XS, fill=charte.FG,
-                anchor='lm')
-            fipui.draw_bar(d, 106, 212, 313, 222, sv / sm,
-                            charte.ORANGE if sv / sm > 0.8 else charte.BLUE)
+        # credits
+        d.line((106, 196, 313, 196), fill=charte.BORDER)
+        sv, sm = m.get('serper'), m.get('serper_max')
+        if isinstance(sv, (int, float)) and isinstance(sm, (int, float)) and sm > 0:
+            d.text((106, 205), 'Serper {:,.0f} / {:,.0f}'.format(
+                sv, sm).replace(',', ' '), font=F_XS, fill=charte.FG, anchor='lm')
+            fipui.draw_bar(d, 106, 214, 313, 223, sv / sm,
+                           charte.ORANGE if sv / sm > 0.8 else charte.BLUE)
         else:
-            d.text((106, 200), 'Serper —', font=F_XS, fill=charte.DIM,
+            d.text((106, 205), 'Serper —', font=F_XS, fill=charte.DIM,
                    anchor='lm')
-        d.text((106, 230), 'MAJ 30 s · S1-S3 copier', font=F_T,
+        d.text((106, 233), 'S1-S3 copier · S4 relire', font=F_T,
                fill=(90, 95, 110), anchor='lm')
 
     def _rg_default(self, img, d):
@@ -2808,8 +2801,8 @@ class ContextuelApp(App):
         F_XS = fipui.font(13)
         F_T = fipui.font(11)
         # ---- colonne GAUCHE (~30%)
-        armed = self._armed and time.time() - self._armed[1] < 3.0 \
-            and self._armed[0]
+        armed = self._armed and self._armed[1] == self.pid \
+            and time.time() - self._armed[2] < 3.0 and self._armed[0]
         caps = [
             (charte.ico_copy, 'Titre', '', None, False),
             (charte.ico_pin, 'Devant', 'ON' if self.topmost else '',
@@ -2843,12 +2836,13 @@ class ContextuelApp(App):
         lines = textwrap.wrap(self.wtitle or '(sans titre)', width=32) or \
             ['(sans titre)']
         y = 110
-        for ln in lines[self.scroll:self.scroll + 7]:
+        s0 = min(max(0, self.scroll), max(0, len(lines) - 7))   # jamais dans le vide
+        for ln in lines[s0:s0 + 7]:
             d.text((106, y), ln, font=F_XS, fill=charte.FG, anchor='lm')
             y += 17
         if len(lines) > 7:
             d.text((311, 92), '{}/{}'.format(
-                min(self.scroll + 7, len(lines)), len(lines)), font=F_T,
+                min(s0 + 7, len(lines)), len(lines)), font=F_T,
                 fill=(90, 95, 110), anchor='rm')
             d.text((210, 228), 'molette = defiler', font=F_T,
                    fill=(90, 95, 110), anchor='mm')

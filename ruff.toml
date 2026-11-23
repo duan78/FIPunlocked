@@ -1,0 +1,25 @@
+# Lint du projet — CI : `ruff check .`
+#
+# Les outils de retro-ingenierie (disas_*.py a la racine ; captures Frida,
+# sondes et anciens daemons dans fipd/) datent du 04-19/11/2026 : gardees
+# tels quels pour l'histoire du projet, hors lint.
+# Tout ce qui TOURNE reste verifie.
+
+extend-exclude = [
+    "disas_*.py",
+    "fipd/capture_startserver.py",
+    "fipd/find_server_app.py",
+    "fipd/fip_native.py",
+    "fipd/fipd.py",
+    "fipd/fipd_v1_backup.py",
+    "fipd/frida_debug.py",
+    "fipd/frida_names.py",
+    "fipd/probe_init2.py",
+    "fipd/probe_native.py",
+    "fipd/replay_session.py",
+    "fipd/sniff_spad.py",
+    "fipd/test_pur_postservice.py",
+]
+
+[lint]
+select = ["E9", "F", "B"]

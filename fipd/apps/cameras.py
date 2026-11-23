@@ -203,7 +203,7 @@ class CamerasApp(App):
     # ---------- rendu ----------
 
     def render_full(self, img):
-        from PIL import Image, ImageDraw
+        from PIL import ImageDraw
         d = ImageDraw.Draw(img)
         F_S = fipui.font(20)
         F_XS = fipui.font(14)

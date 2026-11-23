@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest   # fipd3 pilote une pile Windows (user32, UIA, services)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dépendances
+        # numpy : simule cv2 dans les tests du mode video (pas de dependance du daemon)
+        run: pip install -r requirements.txt numpy ruff
+      - name: Lint (syntaxe, noms, pièges)
+        run: ruff check .          # regles et exclusions : ruff.toml
+      - name: "Tests (aucun FIP requis : DirectOutput.dll est simulée)"
+        run: python -m unittest discover -s tests -v
+      # Etapes validees a l'identique en local (venv vierge, Python 3.12) :
+      # voir tests/hardware/test_recuperation.ps1 pour le test sur le vrai FIP.

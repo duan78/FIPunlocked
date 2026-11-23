@@ -26,7 +26,6 @@ import json
 import os
 import subprocess
 import threading
-import time
 
 import fipui
 from fipui import App
@@ -177,7 +176,9 @@ class DeckApp(App):
                 d.text((16, yc), '-', font=F_S, fill=(70, 75, 92), anchor='lm')
             d.text((306, yc), f'S{r + 1}', font=F_XS, fill=(90, 95, 110),
                    anchor='rm')
-        if npages > 1:
-            d.text((160, 231), f'{page.get("title", "DECK")} — deck {self.view + 1}/{npages}'
-                   '  (molette droite, gauche = page FIP)', font=F_XS,
-                   fill=(120, 120, 130), anchor='mm')
+        if npages > 1:                       # repere compact, sous le tag de la 6e rangee
+            tag = f"{page.get('title', 'DECK')} · {self.view + 1}/{npages}"
+            while tag and d.textlength(tag, font=fipui.font(11)) > 170:
+                tag = tag[1:]
+            d.text((316, 233), tag, font=fipui.font(11), fill=(120, 120, 130),
+                   anchor='rm')

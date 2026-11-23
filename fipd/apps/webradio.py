@@ -23,7 +23,6 @@ import re
 import shutil
 import subprocess
 import threading
-import time
 
 import fipui
 from fipui import App
@@ -193,6 +192,12 @@ class WebRadioApp(App):
                 proc.stderr.close()
             except Exception:
                 pass
+            if proc is self._proc:              # ffplay est mort tout seul (flux coupe)
+                self._proc = None               # : pas de faux « EN DIRECT »
+                self.playing = False
+                self.status = 'flux termine'
+                self.set_led(7, False)
+                self.d._redraw_now()
 
     def on_leave(self):
         self._kill()                    # pas de radio fantome sur une autre page

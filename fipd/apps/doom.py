@@ -260,7 +260,7 @@ class DoomApp(App):
         self.fire_cd = 0.0
         self._glock = threading.Lock()
         self._zb = [1e9] * NCOLS
-        self._stop = threading.Event()
+        self._halt = threading.Event()      # arret de la boucle de jeu (on_leave)
         self._thread = None
         self._mk_sprites()
         self._new_level(1)
@@ -341,21 +341,25 @@ class DoomApp(App):
     # ---------------------------------------------- cycle de vie FIP --
 
     def on_enter(self):
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        if self._thread is not None and self._thread.is_alive():
+            self._sync_leds()               # deja en marche : pas de boucle orpheline
+            return
+        self._halt = threading.Event()
+        self._thread = threading.Thread(target=self._loop, args=(self._halt,),
+                                        daemon=True, name='doom-loop')
         self._thread.start()
         self._sync_leds()
 
     def on_leave(self):
-        self._stop.set()
+        self._halt.set()
         for i in range(1, 7):
             self.d.set_led(i, False)
 
-    def _loop(self):
+    def _loop(self, halt):
         """Boucle de jeu : physique ~50 Hz, redraw ~12 Hz max."""
         last = time.time()
         last_draw = 0.0
-        while not self._stop.is_set():
+        while not halt.is_set():
             now = time.time()
             dt = min(0.1, now - last)
             last = now
@@ -373,7 +377,7 @@ class DoomApp(App):
             if now - last_draw >= 0.08 and self.state in ('play', 'won'):
                 last_draw = now
                 self.d._redraw_now()
-            self._stop.wait(0.02)
+            halt.wait(0.02)
 
     # ---------------------------------------------------- evenements --
 
@@ -513,7 +517,6 @@ class DoomApp(App):
                 self._sync_leds()
 
     def _update(self, dt):
-        now = time.time()
         self.fire_cd = max(0.0, self.fire_cd - dt)
         self.recoil = max(0.0, self.recoil - dt * 5)
         self.muzzle = max(0.0, self.muzzle - dt)

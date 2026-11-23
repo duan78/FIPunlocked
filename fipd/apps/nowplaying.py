@@ -33,6 +33,7 @@ SEEK_S = 10              # secondes par cran de molette
 POLL_S = 1.0
 VLC_CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vlc.json')
 VLC_DEFAULTS = {'host': '127.0.0.1', 'port': 8080, 'password': 'fipd'}
+VLC_RETRY_MAX_S = 30.0    # VLC muet : on espacera les essais (2 s, 4 s, ... 30 s)
 
 
 def _fmt(s):
@@ -56,13 +57,18 @@ class NowPlayingApp(App):
         self._mgr = None
         self._art_key = None        # (title, artist, album) courant
         self._art = None            # PIL Image pochette (RGB)
+        self._cfg = None            # vlc.json en cache (relu si le fichier change)
+        self._cfg_t = None
+        self._vlc_next = 0.0        # date du prochain essai VLC
+        self._vlc_fail = 0
         if HAVE_SMTC:
-            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name='nowplaying-poll')
             self._thread.start()
         else:
             self.error = 'pip install winrt-Windows.Media.Control'
 
-    # ---------- thread de poll SMTC ----------
+    # ---------- thread de poll SMTC (page affichee seulement) ----------
 
     def _run(self):
         asyncio.run(self._poll())
@@ -71,12 +77,16 @@ class NowPlayingApp(App):
         self._mgr = await _Mgr.request_async()
         self._aio = asyncio.get_running_loop()
         while not self._stop.is_set():
+            if not self._shown.is_set():
+                self._shown.wait()        # page masquee : aucune requete SMTC ni VLC
+                if self._stop.is_set():
+                    return
             try:
                 await self._refresh()
                 self.error = None
             except Exception as e:
                 self.error = str(e)
-            if self.info is None:
+            if self.info is None and time.time() >= self._vlc_next:
                 self._refresh_vlc()      # secours : interface Web de VLC
             self.hb += 1
             await asyncio.sleep(POLL_S)
@@ -155,18 +165,25 @@ class NowPlayingApp(App):
     # ---------- secours : interface Web de VLC ----------
 
     def _load_vlc_cfg(self):
+        try:
+            m = os.path.getmtime(VLC_CFG)
+        except OSError:
+            m = None
+        if self._cfg is not None and m == self._cfg_t:     # relu seulement si modifie
+            return dict(self._cfg)
         cfg = dict(VLC_DEFAULTS)
         try:
-            with open(VLC_CFG, encoding='utf-8') as f:
-                cfg.update(json.load(f))
-        except OSError:
-            try:
+            if m is None:
                 with open(VLC_CFG, 'w', encoding='utf-8') as f:
                     json.dump(VLC_DEFAULTS, f, indent=2)
-            except OSError:
-                pass
+            else:
+                with open(VLC_CFG, encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
         except Exception:
             pass
+        self._cfg, self._cfg_t = dict(cfg), m
         return cfg
 
     def _vlc_url(self, cfg):
@@ -188,7 +205,11 @@ class NowPlayingApp(App):
         if not st:
             self.info = None                 # plus aucune source
             self.set_led(7, False)
+            self._vlc_fail += 1              # VLC ne repond pas : essais espaces
+            self._vlc_next = time.time() + min(
+                VLC_RETRY_MAX_S, 2.0 ** min(5, self._vlc_fail))
             return
+        self._vlc_fail, self._vlc_next = 0, 0.0
         self._art = None                     # pas de pochette via VLC
         self._art_key = None
         meta = ((st.get('information') or {}).get('category')

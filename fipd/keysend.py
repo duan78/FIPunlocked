@@ -1,9 +1,21 @@
 """
 keysend.py — Envoi de raccourcis clavier par SendInput (scancodes), pour fipd3.
-Supporte les modificateux maintenus (combo down/up) et les touches etendues/media.
+Supporte les modificateurs maintenus (combo down/up) et les touches etendues/media.
+
+Deux familles de touches :
+  - IMPRIMABLES (lettres, chiffres, signes) : résolues par la disposition
+    clavier COURANTE (VkKeyScanEx + MapVirtualKeyEx). 'a' désigne donc le
+    caractère a, que le clavier soit AZERTY, QWERTY ou autre — les scancodes
+    physiques changent, pas la touche visée. Un caractère est envoyé SANS
+    Shift : 'ctrl+1' reste le raccourci « touche 1 », même si le 1 demande
+    Shift sur la disposition.
+  - NOMMÉES (f1, up, win, volumemute...) : table fixe ; celles qui le
+    nécessitent portent l'indicateur étendu (win, rctrl, flèches, media...).
+Les touches sont relâchées dans l'ordre inverse de l'appui.
 """
 import ctypes
 import ctypes.wintypes as wt
+import string
 
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
@@ -11,6 +23,7 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 INPUT_KEYBOARD = 1
+MAPVK_VK_TO_VSC = 0
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -30,14 +43,19 @@ class INPUT(ctypes.Structure):
 
 user32 = ctypes.WinDLL('user32')
 user32.SendInput.argtypes = [wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wt.UINT
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+user32.GetKeyboardLayout.argtypes = [wt.DWORD]
+user32.GetKeyboardLayout.restype = wt.HANDLE
+user32.MapVirtualKeyExW.argtypes = [wt.UINT, wt.UINT, wt.HANDLE]
+user32.MapVirtualKeyExW.restype = wt.UINT
+user32.VkKeyScanExW.argtypes = [wt.WCHAR, wt.HANDLE]
+user32.VkKeyScanExW.restype = ctypes.c_short
 
-# name -> (scancode, extended) ; E0xx = extended
-_SCAN = {
-    **{c: (0x10 + ord(c) - ord('q'), False) for c in 'qwertyuiop'},
-    **{c: (0x1E + ord(c) - ord('a'), False) for c in 'asdfghjkl'},
-    **{c: (0x2C + ord(c) - ord('z'), False) for c in 'zxcvbnm'},
-    **{str(d): (0x02 + d - 1, False) for d in range(1, 10)},
-    '0': (0x0B, False),
+# name -> (scancode, extended) ; True = touche etendue (E0)
+_NAMED = {
     'f1': (0x3B, False), 'f2': (0x3C, False), 'f3': (0x3D, False), 'f4': (0x3E, False),
     'f5': (0x3F, False), 'f6': (0x40, False), 'f7': (0x41, False), 'f8': (0x42, False),
     'f9': (0x43, False), 'f10': (0x44, False), 'f11': (0x57, False), 'f12': (0x58, False),
@@ -47,10 +65,7 @@ _SCAN = {
     'ctrl': (0x1D, False), 'lctrl': (0x1D, False), 'rctrl': (0x1D, True),
     'shift': (0x2A, False), 'lshift': (0x2A, False), 'rshift': (0x36, False),
     'alt': (0x38, False), 'lalt': (0x38, False), 'ralt': (0x38, True),
-    'win': (0x5B, False), 'lwin': (0x5B, False), 'rwin': (0x5C, True),
-    '-': (0x0C, False), '=': (0x0D, False), '[': (0x1A, False), ']': (0x1B, False),
-    ';': (0x27, False), "'": (0x28, False), '`': (0x29, False),
-    ',': (0x33, False), '.': (0x34, False), '/': (0x35, False), '\\': (0x2B, False),
+    'win': (0x5B, True), 'lwin': (0x5B, True), 'rwin': (0x5C, True),
     'up': (0x48, True), 'down': (0x50, True), 'left': (0x4B, True), 'right': (0x4D, True),
     'pageup': (0x49, True), 'pgup': (0x49, True), 'pagedown': (0x51, True),
     'pgdn': (0x51, True), 'home': (0x47, True), 'end': (0x4F, True),
@@ -61,10 +76,39 @@ _SCAN = {
     'medianext': (0x19, True), 'mediaprev': (0x10, True),
     'npenter': (0x1C, True),
 }
+_CHARS = string.ascii_lowercase + string.digits + "-=[]\\;',./`"
 
 
 def key_names():
-    return sorted(_SCAN)
+    """Touches reconnues : nommées + caractères imprimables (résolus par la disposition)."""
+    return sorted(_NAMED) + list(_CHARS)
+
+
+def current_layout():
+    """Disposition clavier du thread de la fenêtre au premier plan (repli :
+    celle du thread courant)."""
+    try:
+        h = user32.GetForegroundWindow()
+        if h:
+            hkl = user32.GetKeyboardLayout(user32.GetWindowThreadProcessId(h, None))
+            if hkl:
+                return hkl
+    except Exception:
+        pass
+    return user32.GetKeyboardLayout(0)
+
+
+def resolve(name):
+    """name -> (name, scancode, etendue). KeyError si absent de la disposition."""
+    if len(name) == 1:
+        hkl = current_layout()
+        vk = user32.VkKeyScanExW(name, hkl)
+        sc = user32.MapVirtualKeyExW(vk & 0xFF, MAPVK_VK_TO_VSC, hkl) if vk != -1 else 0
+        if not sc:
+            raise KeyError('touche absente de la disposition clavier : %r' % name)
+        return (name, sc, False)
+    sc, ext = _NAMED[name]                # KeyError si inconnue
+    return (name, sc, ext)
 
 
 def _mk(scan, extended, up):
@@ -77,16 +121,22 @@ def _mk(scan, extended, up):
 
 
 def parse_combo(text):
-    """'ctrl+shift+s' -> [('ctrl',...), ('shift',...), ('s',...)] ; KeyError si inconnu."""
+    """'ctrl+shift+s' -> [('ctrl',...), ('shift',...), ('s',...)] ; KeyError si inconnue."""
     parts = [p.strip().lower() for p in text.split('+') if p.strip()]
     if not parts:
         raise ValueError('combo vide')
-    return [(p, *_SCAN[p]) for p in parts]
+    return [resolve(p) for p in parts]
 
 
 def send(parts, up=False):
-    arr = (INPUT * len(parts))(*[_mk(sc, ext, up) for _, sc, ext in parts])
-    return user32.SendInput(len(parts), arr, ctypes.sizeof(INPUT))
+    """Envoie les touches : appui dans l'ordre du combo, relâchement en ordre
+    inverse (la touche d'abord, les modificateurs ensuite)."""
+    seq = list(reversed(parts)) if up else parts
+    arr = (INPUT * len(seq))(*[_mk(sc, ext, up) for _, sc, ext in seq])
+    n = user32.SendInput(len(seq), arr, ctypes.sizeof(INPUT))
+    if n != len(seq):
+        raise RuntimeError('SendInput refuse (%d/%d) — fenêtre élevée ?' % (n, len(seq)))
+    return n
 
 
 def tap(text):

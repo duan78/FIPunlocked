@@ -8,7 +8,12 @@ Ecran : une rangee par repo (alignee sur S1-S6), points de statut des
 derniers runs (vert = succes, rouge = echec, bleu = en cours, gris = autre).
 Molette droite = defilement si plus de 6 repos.
 Bouton S<n> = ouvrir le dernier run du repo correspondant dans le navigateur.
-Alerte FIP + LED 8 quand un run passe en echec (une seule fois par run).
+Alerte FIP + LED 8 quand un run PASSE en echec (une seule fois par run) : un
+run vu "en cours" puis termine en echec est bien signale.
+
+Le poll `gh` ne tourne QUE pendant que la page est affichée (fipui poll) :
+à l'entrée, un passage immédiat rafraîchit chaque repo, puis toutes les
+poll_s secondes. Rien ne tourne en arrière-plan quand la page est masquée.
 """
 import json
 import os
@@ -24,8 +29,6 @@ CFG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'github.json')
 RUN_FIELDS = 'databaseId,status,conclusion,workflowName,headBranch,url'
 DOT_COLORS = {'success': fipui.GREEN, 'failure': fipui.RED,
               'cancelled': (120, 125, 140), 'startup_failure': fipui.RED}
-STATUS_CHARS = {'success': 'OK', 'failure': 'ECHEC', 'in_progress': 'EN COURS',
-                'queued': 'EN FILE'}
 
 
 def _gh(args, timeout=20):
@@ -46,11 +49,13 @@ class GithubCiApp(App):
         self.repos = []             # [{'name', 'runs': [...], 'error'}]
         self.view = 0
         self.status = 'initialisation...'
-        self._seen_fail = {}        # repo -> {run_id: bool}
+        self._seen = {}             # repo -> {run_id: derniere conclusion connue}
         self._primed = set()        # repos ayant eu un 1er poll complet
-        self._stop = threading.Event()
         self._lock = threading.Lock()
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._cfg_done = False
+        self._period = 60
+        self._next = 0.0            # date du prochain passage
+        self.poll(self._tick, 1.0)  # page affichée seulement
 
     # ---------- config ----------
 
@@ -75,43 +80,67 @@ class GithubCiApp(App):
             pass
         return cfg
 
-    # ---------- boucle de poll ----------
-
-    def _loop(self):
+    def _ensure_cfg(self):
+        if self._cfg_done:
+            return
         cfg = self._load_cfg()
+        self._cfg_done = True
         names = cfg.get('repos') or []
+        try:
+            self._period = max(20, int(cfg.get('poll_s', 60)))
+        except (TypeError, ValueError):
+            self._period = 60
         with self._lock:
             self.repos = [{'name': n, 'runs': [], 'error': None} for n in names]
-        if not names:
-            self.status = 'aucun repo (apps/github.json)'
+
+    # ---------- poll (page affichée) ----------
+
+    def _tick(self):
+        """Appelé toutes les secondes par poll() : un passage gh quand c'est l'heure."""
+        if time.time() < self._next:
             return
-        period = max(20, int(cfg.get('poll_s', 60)))
-        while not self._stop.is_set():
-            for repo in list(self.repos):
-                if self._stop.is_set():
-                    break
-                try:
-                    runs = _gh(['run', 'list', '-R', repo['name'],
-                                '--limit', '4', '--json', RUN_FIELDS])
-                    self._check_alerts(repo['name'], runs)
-                    with self._lock:
-                        repo['runs'] = runs
-                        repo['error'] = None
-                    self.status = 'maj ' + time.strftime('%H:%M:%S')
-                except Exception as e:
-                    with self._lock:
-                        repo['error'] = str(e)[:60]
-            self._stop.wait(period)
+        try:
+            self._ensure_cfg()
+        except Exception as e:
+            print('[githubci] config:', e, flush=True)
+        with self._lock:
+            repos = list(self.repos)
+        if not repos:
+            self.status = 'aucun repo (apps/github.json)'
+            self._next = time.time() + 10.0
+            return
+        for repo in repos:
+            if self._stop.is_set() or not self.shown():
+                return            # page quittee au milieu : on reprendra a l'entree
+            self._poll_repo(repo)
+        self._next = time.time() + self._period
+
+    def _poll_repo(self, repo):
+        try:
+            runs = _gh(['run', 'list', '-R', repo['name'],
+                        '--limit', '4', '--json', RUN_FIELDS])
+            self._check_alerts(repo['name'], runs)
+            with self._lock:
+                repo['runs'] = runs
+                repo['error'] = None
+            self.status = 'maj ' + time.strftime('%H:%M:%S')
+            self.d._redraw_now()
+        except Exception as e:
+            with self._lock:
+                repo['error'] = str(e)[:60]
 
     def _check_alerts(self, repo, runs):
-        seen = self._seen_fail.setdefault(repo, {})
+        """Alerte quand un run passe en echec (conclusion 'failure' alors que la
+        derniere connue n'etait pas 'failure'), une seule fois par run ; pas
+        d'alerte au 1er poll d'un repo (echecs anciens deja connus)."""
+        seen = self._seen.setdefault(repo, {})
         primed = repo in self._primed
         for r in runs:
-            rid = r['databaseId']
-            if r.get('conclusion') == 'failure' and not seen.get(rid):
-                if primed:                        # pas d'alerte au 1er poll
-                    self.alert(f'{repo.split("/")[-1]}: ECHEC CI')
-            seen[rid] = True
+            rid, concl = r['databaseId'], r.get('conclusion')
+            if primed and concl == 'failure' and seen.get(rid) != 'failure':
+                self.alert(f'{repo.split("/")[-1]}: ECHEC CI')
+            if concl:
+                seen[rid] = concl            # conclusion d'un run termine
         self._primed.add(repo)
         # purge des ids disparus
         live = {r['databaseId'] for r in runs}
@@ -142,6 +171,7 @@ class GithubCiApp(App):
             self.alert('ouverture ' + repo['name'].split('/')[-1])
 
     def http_get(self):
+        self._ensure_cfg()
         with self._lock:
             return {'status': self.status,
                     'repos': [{'name': r['name'], 'error': r['error'],

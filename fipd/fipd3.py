@@ -34,7 +34,10 @@ Daemon.start() et l'instance D est creee par main() (tests, gen_screens).
 """
 import ctypes
 import ctypes.wintypes as wt
+import hashlib
 import html
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -84,12 +87,45 @@ DEFAULT_BINDINGS = {
 
 
 def _stat(path):
-    """(mtime_ns, taille) d'un fichier, ou None s'il est absent."""
+    """Empreinte du CONTENU d'un fichier (sha1), ou None s'il est absent.
+    Un fichier modifie se detecte par son contenu : ni la date (granularite
+    de l'horloge systeme) ni la taille (edition de meme longueur) ne
+    distinguent surement deux enregistrements rapproches."""
     try:
-        st = os.stat(path)
+        with open(path, 'rb') as f:
+            return hashlib.sha1(f.read()).hexdigest()
     except OSError:
         return None
-    return (st.st_mtime_ns, st.st_size)
+
+
+class _FreshSource(importlib.machinery.SourceFileLoader):
+    """Chargeur qui compile TOUJOURS la source lue, sans .pyc. Python tient un
+    .pyc pour valide sur la date en SECONDES et la taille de la source : une
+    edition de meme longueur enregistree dans la meme seconde que le
+    chargement precedent relancerait l'ancien code (defaut revele par
+    l'integration continue, masque en local par des tests lances avec -B)."""
+
+    def get_code(self, fullname):
+        return self.source_to_code(self.get_data(self.path), self.path)
+
+
+def _module_from_source(name, path):
+    """Module `name` execute depuis le contenu ACTUEL de `path` (cf. _FreshSource),
+    deja place dans sys.modules. Si l'execution echoue (syntaxe, import...),
+    l'ancien module reste en place et l'exception est relayee."""
+    spec = importlib.util.spec_from_file_location(name, path, loader=_FreshSource(name, path))
+    mod = importlib.util.module_from_spec(spec)
+    old = sys.modules.get(name)
+    sys.modules[name] = mod              # tracebacks et repr lisibles
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        if old is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = old
+        raise
+    return mod
 
 
 _SELF_STAT = _stat(os.path.join(HERE, os.path.basename(__file__)))
@@ -655,16 +691,14 @@ class Daemon:
 
     def _load_app_file(self, fn, path):
         """Importe un fichier d'app -> (instances, erreurs). Un fichier peut
-        definir plusieurs apps. Les instances portent _file/_stat (reload cible)."""
-        import importlib.util
+        definir plusieurs apps. Les instances portent _file/_stat (reload cible).
+        L'empreinte est prise AVANT l'import : une edition qui survient pendant
+        l'import reste a detecter au prochain reload (l'inverse la cacherait)."""
         modname = f'_fipapp_{fn[:-3]}'
+        fp = _stat(path)
         try:
-            spec = importlib.util.spec_from_file_location(modname, path)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[modname] = mod          # tracebacks et repr lisibles
-            spec.loader.exec_module(mod)
+            mod = _module_from_source(modname, path)
         except Exception as e:
-            sys.modules.pop(modname, None)
             msg = f'[apps] {fn}: import echoue: {e}'
             print(msg, flush=True)
             return [], [msg]
@@ -678,7 +712,7 @@ class Daemon:
                     inst = cls(self)
                     inst._external = True
                     inst._file = fn
-                    inst._stat = _stat(path)
+                    inst._stat = fp
                     found.append(inst)
                 except Exception as e:
                     msg = f'[apps] {fn}:{cls.__name__}: instanciation: {e}'
@@ -707,7 +741,7 @@ class Daemon:
         if self.mode != 'ui':
             return {'error': 'mode ' + self.mode + ' actif : POST /ui avant'}
         # --- modules partages : modifies depuis le chargement ?
-        restart = []
+        restart, errors = [], []
         rebuild = False
         for name, path in self._shared_modules().items():
             now = _stat(path)
@@ -716,9 +750,14 @@ class Daemon:
             self._shared[name] = now
             if name in ('uiatabs', 'fipui', 'keysend'):
                 restart.append(name)
-            else:
-                sys.modules.pop(name, None)     # les apps le re-importent
-                rebuild = True
+                continue
+            try:
+                _module_from_source(name, path)     # les apps le re-importent
+            except Exception as e:                  # casse : l'ancien module reste
+                errors.append(f'[shared] {name}: import echoue: {e}')
+                print(errors[-1], flush=True)
+                continue
+            rebuild = True
         if _stat(os.path.abspath(__file__)) != _SELF_STAT:
             restart.append('fipd3')
         rebuild = rebuild or only == '*'
@@ -727,7 +766,7 @@ class Daemon:
         old_ext = [a for a in self.apps if getattr(a, '_external', False)]
         old_names = [a.name for a in self.apps]
         shown = self.apps[self.page]             # instance affichee AVANT le reload
-        new_ext, reloaded, errors = [], [], []
+        new_ext, reloaded = [], []
         for fn, path in self._app_files().items():
             olds = [a for a in old_ext if getattr(a, '_file', None) == fn]
             wanted = (only is not None and only != '*'

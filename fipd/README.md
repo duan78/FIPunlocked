@@ -118,7 +118,9 @@ a été remplacé par DOOM le 22/11.)
 
 **Apps tierces** (`apps/*.py`, chargées au démarrage + `POST /apps/reload`
 à chaud — seuls les fichiers modifiés sont reconstruits, les autres gardent
-leur état ; un fichier cassé laisse l'ancienne version en service ; un module
+leur état ; un fichier modifié est reconnu par son contenu et compilé depuis
+la source, jamais repris d'un `.pyc` de la version d'avant ; un fichier cassé
+laisse l'ancienne version en service ; un module
 partagé (`charte`) modifié impose de tout reconstruire, `uiatabs`/`fipui`/
 `keysend`/`fipd3` modifiés = redémarrage requis, signalé dans la réponse) :
 une classe `fipui.App` avec `name` != 'app' et pas `abstract` ;

@@ -18,6 +18,8 @@ jobs:
       - name: Lint (syntaxe, noms, pièges)
         run: ruff check .          # regles et exclusions : ruff.toml
       - name: "Tests (aucun FIP requis : DirectOutput.dll est simulée)"
+        # Sans -B : l'ecriture des .pyc fait partie du terrain de test (un
+        # rechargement d'app ne doit jamais reprendre un .pyc perime).
         run: python -m unittest discover -s tests -v
       # Etapes validees a l'identique en local (venv vierge, Python 3.12) :
       # voir tests/hardware/test_recuperation.ps1 pour le test sur le vrai FIP.

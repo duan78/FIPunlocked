@@ -3,9 +3,13 @@ modes image/video, reprise apres perte du peripherique, API locale seulement,
 reload cible. DirectOutput.dll est remplacee par un faux qui rejoue les
 callbacks PageChange du service."""
 import ctypes
+import importlib.util
 import json
 import os
+import py_compile
 import shutil
+import struct
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +34,22 @@ def _hr(code, message):
 
 def _page_not_active():
     return _hr(0xFF040001, 'E_PAGENOTACTIVE')
+
+
+def _put(path, text):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def _pass_as_current(pyc, source):
+    """Fait passer un .pyc pour a jour alors qu'il compile une ANCIENNE version
+    de la source : Python n'y verifie que la date (a la seconde) et la taille,
+    remplacees ici par celles de la source actuelle."""
+    st = os.stat(source)
+    with open(pyc, 'r+b') as f:
+        f.seek(8)                      # en-tete : magic, flags, date, taille
+        f.write(struct.pack('<II', int(st.st_mtime) & 0xFFFFFFFF,
+                            st.st_size & 0xFFFFFFFF))
 
 
 class FakeDo:
@@ -662,6 +682,12 @@ class ReloadTests(unittest.TestCase):
              "class B(fipui.App):\n"
              "    name = 'appb'\n"
              "    title = 'B'\n")
+    APP_C = ("import fipui\n"
+             "import fipshared_sh\n"            # module partage factice (fipd_shared_*)
+             "class C(fipui.App):\n"
+             "    name = 'appc'\n"
+             "    title = 'C'\n"
+             "    tag = fipshared_sh.tag\n")
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix='fipd_apps_')
@@ -672,13 +698,14 @@ class ReloadTests(unittest.TestCase):
 
     def tearDown(self):
         fipd3.APPS_DIR = self._dir
-        for name in list(__import__('sys').modules):
+        for name in list(sys.modules):
             if name.startswith('_fipapp_'):
-                __import__('sys').modules.pop(name, None)
+                sys.modules.pop(name, None)
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def _write(self, name, text):
-        time.sleep(0.01)                # mtime ns different a coup sur
+        # Sans attente : un fichier modifie se detecte par son contenu. Sur sa
+        # date, deux ecritures rapprochees peuvent en avoir la meme.
         with open(os.path.join(self.dir, name), 'w', encoding='utf-8') as f:
             f.write(text)
 
@@ -689,6 +716,24 @@ class ReloadTests(unittest.TestCase):
         fake.daemon = d
         d._entered = d.apps[0]
         return d, fake
+
+    def test_same_size_edit_right_after_loading_is_rebuilt(self):
+        """L'echec de la premiere CI : 'tag = 1' -> 'tag = 2' (meme longueur),
+        enregistre aussitot apres le chargement. Le daemon annoncait le
+        rechargement et relançait l'ancien code. Le .pyc de l'ancien est arme
+        pour passer pour a jour : Python n'y voit que la meme date (a la
+        seconde) et la meme taille. La source doit l'emporter."""
+        with helpers.quiet():
+            d, fake = self._load()
+            a = d.apps[6]
+            src = os.path.join(self.dir, 'a.py')
+            pyc = py_compile.compile(src, doraise=True)   # bytecode de 'tag = 1'
+            self._write('a.py', self.APP_A % 2)
+            _pass_as_current(pyc, src)
+            r = d.reload_apps()
+            self.assertEqual(r['reloaded'], ['a.py'])
+            self.assertIsNot(d.apps[6], a)
+            self.assertEqual(d.apps[6].tag, 2)
 
     @staticmethod
     def _registered(fake):
@@ -752,6 +797,50 @@ class ReloadTests(unittest.TestCase):
             self.assertIsNot(d.apps[6], a)
             self.assertIsNot(d.apps[7], b)
 
+    def test_changed_shared_module_is_compiled_from_source(self):
+        """Module partage modifie : les apps repartent avec le NOUVEAU code.
+        Le .pyc de l'ancien est arme pour passer pour a jour (date a la seconde
+        et taille de la source) : un import ordinaire le reprendrait."""
+        shared = tempfile.mkdtemp(prefix='fipd_shared_')
+        self._write('a.py', self.APP_C)
+        try:
+            sh = os.path.join(shared, 'sh.py')
+            _put(sh, 'tag = 1\n')
+            fipd3._module_from_source('fipshared_sh', sh)
+            pyc = py_compile.compile(sh, doraise=True)     # bytecode de l'ancien code
+            with helpers.quiet(), mock.patch.object(fipd3, 'HERE', shared):
+                d, fake = self._load()
+                self.assertEqual((d.apps[6].tag, d._shared), (1, {'fipshared_sh': fipd3._stat(sh)}))
+                _put(sh, 'tag = 2\n')                      # meme longueur, aussitot
+                _pass_as_current(pyc, sh)
+                r = d.reload_apps()
+                self.assertEqual((r['errors'], sorted(r['reloaded'])), ([], ['a.py', 'b.py']))
+                self.assertEqual(d.apps[6].tag, 2)
+                self.assertEqual(sys.modules['fipshared_sh'].tag, 2)
+        finally:
+            sys.modules.pop('fipshared_sh', None)
+            shutil.rmtree(shared, ignore_errors=True)
+
+    def test_broken_shared_module_keeps_the_old_one(self):
+        shared = tempfile.mkdtemp(prefix='fipd_shared_')
+        self._write('a.py', self.APP_C)
+        try:
+            sh = os.path.join(shared, 'sh.py')
+            _put(sh, 'tag = 1\n')
+            old = fipd3._module_from_source('fipshared_sh', sh)
+            with helpers.quiet(), mock.patch.object(fipd3, 'HERE', shared):
+                d, fake = self._load()
+                a = d.apps[6]
+                _put(sh, 'def broken(:\n')
+                r = d.reload_apps()
+                self.assertTrue(r['errors'])
+                self.assertEqual((r['reloaded'], r['restart_required']), ([], []))
+                self.assertIs(sys.modules['fipshared_sh'], old)   # l'ancien reste en service
+                self.assertIs(d.apps[6], a)
+        finally:
+            sys.modules.pop('fipshared_sh', None)
+            shutil.rmtree(shared, ignore_errors=True)
+
     def test_restart_required_is_reported(self):
         with helpers.quiet():
             d, fake = self._load()
@@ -759,6 +848,101 @@ class ReloadTests(unittest.TestCase):
             r = d.reload_apps()
             self.assertEqual(r['restart_required'], ['uiatabs'])
             self.assertEqual(r['reloaded'], [])
+
+
+class FingerprintTests(unittest.TestCase):
+    """fipd3._stat : empreinte du CONTENU, base de la recharge a chaud ciblee
+    (apps tierces, modules partages, daemon)."""
+    FILE = 'fipd_fingerprint_test.py'
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='fipd_fp_')
+        self.path = os.path.join(self.dir, self.FILE)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, text):
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return self.path
+
+    def test_missing_file(self):
+        self.assertIsNone(fipd3._stat(self.path))
+
+    def test_same_content_same_fingerprint(self):
+        self._write('tag = 1\n')
+        first = fipd3._stat(self.path)
+        self._write('tag = 1\n')                        # enregistre a l'identique
+        self.assertEqual(fipd3._stat(self.path), first)   # rien a reconstruire
+
+    def test_same_size_edit_in_the_same_clock_tick(self):
+        """Sur la date, deux enregistrements de meme longueur dans le meme top
+        d'horloge sont indiscernables : meme date ET meme taille. La date est
+        figee ici pour reproduire la situation sur toute machine."""
+        self._write('tag = 1\n')
+        first = fipd3._stat(self.path)
+        v1 = os.stat(self.path)
+        self._write('tag = 2\n')                        # aussitot : meme longueur
+        with mock.patch.object(fipd3.os, 'stat', return_value=v1):
+            self.assertEqual(os.stat(self.path).st_size, v1.st_size)
+            self.assertEqual(os.stat(self.path).st_mtime_ns, v1.st_mtime_ns)
+            self.assertNotEqual(fipd3._stat(self.path), first)
+
+
+class SourceLoadTests(unittest.TestCase):
+    """fipd3._module_from_source : apps tierces et modules partages sont
+    compiles depuis la source a chaque chargement. Python reprendrait sinon un
+    .pyc perime des que la source garde la meme taille dans la meme seconde
+    (l'echec CI : le daemon annoncait le rechargement et relançait l'ancien
+    code)."""
+    NAME = '_fipd_sourceload_test'
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='fipd_src_')
+        self.path = os.path.join(self.dir, 'mod.py')
+
+    def tearDown(self):
+        sys.modules.pop(self.NAME, None)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, text):
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def test_stale_pyc_is_never_used(self):
+        self._write('tag = 1\n')
+        pyc = py_compile.compile(self.path, doraise=True)   # bytecode de l'ancien code
+        self._write('tag = 2\n')                            # meme longueur
+        _pass_as_current(pyc, self.path)
+        spec = importlib.util.spec_from_file_location(self.NAME + '_plain', self.path)
+        plain = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plain)                      # import ORDINAIRE :
+        if plain.tag != 1:                                  # il croit le .pyc a jour
+            self.skipTest('cette version de Python ne reprend plus un .pyc perime')
+        mod = fipd3._module_from_source(self.NAME, self.path)
+        self.assertEqual(mod.tag, 2)
+        self.assertIs(sys.modules[self.NAME], mod)
+        self.assertEqual(mod.__file__, self.path)
+
+    def test_no_pyc_is_written(self):
+        self._write('tag = 1\n')
+        fipd3._module_from_source(self.NAME, self.path)
+        self.assertEqual(os.listdir(self.dir), ['mod.py'])
+
+    def test_failed_run_keeps_the_previous_module(self):
+        self._write('tag = 1\n')
+        old = fipd3._module_from_source(self.NAME, self.path)
+        self._write('def broken(:\n')
+        with self.assertRaises(SyntaxError):
+            fipd3._module_from_source(self.NAME, self.path)
+        self.assertIs(sys.modules[self.NAME], old)
+
+    def test_failed_first_run_leaves_no_module(self):
+        self._write('def broken(:\n')
+        with self.assertRaises(SyntaxError):
+            fipd3._module_from_source(self.NAME, self.path)
+        self.assertNotIn(self.NAME, sys.modules)
 
 
 if __name__ == '__main__':

@@ -113,8 +113,9 @@ class PollLifecycleTests(unittest.TestCase):
 
             def __init__(self):
                 super().__init__(FakeDaemon())
-                self.poll(lambda: (calls.append(1), hits.append(threading.current_thread().name)),
-                          0.05)
+                self.thread = self.poll(
+                    lambda: (calls.append(1), hits.append(threading.current_thread().name)),
+                    0.05)
 
         app = P()
         time.sleep(0.3)
@@ -134,8 +135,10 @@ class PollLifecycleTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(len(calls), n2)
         app._stop.set()
-        time.sleep(0.15)
-        self.assertFalse(any(t.name == 'polltest-poll' for t in threading.enumerate()))
+        # page masquee : le thread endormi ne voit _stop qu'a la fin de son
+        # attente (0,5 s max) -> on l'attend, sans miser sur une duree de sommeil
+        app.thread.join(2)
+        self.assertFalse(app.thread.is_alive())
 
     def test_poll_survives_exception(self):
         calls = []
